@@ -1653,8 +1653,7 @@ module.exports = class RikkaPlugin extends Plugin {
       if (!Number.isFinite(count) || row.querySelector(".rikka-row-wordcount")) return;
       row.createSpan({ cls: "rikka-row-wordcount", text: `${count.toLocaleString()}w` });
     });
-    const label = container.createSpan({ cls: "rikka-target-label", text: `${words.toLocaleString()} draft words` });
-    label.setAttr("aria-live", "polite");
+    void words; // total draft word count is intentionally not shown
   }
 
   promptNewFromTemplate() {
