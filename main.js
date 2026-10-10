@@ -208,15 +208,19 @@ class RikkaBinderView extends ItemView {
       : key === "trash" ? `${items.length ? "BinderTrashFull" : "BinderTrashEmpty"}@2x@2x.png`
       : null;
     if (binderIcon) {
-      const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/${binderIcon}`;
-      glyph.createEl("img", {
-        cls: "rikka-scrivener-icon",
-        attr: {
-          src: RIKKA_ICON_DATA[binderIcon] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
-          alt: "",
-          "aria-hidden": "true",
-        },
-      });
+      if (Platform.isMobile) {
+        setIcon(glyph, key === "draft" ? "folder-open" : key === "research" ? "library" : "trash-2");
+      } else {
+        const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/${binderIcon}`;
+        glyph.createEl("img", {
+          cls: "rikka-scrivener-icon",
+          attr: {
+            src: RIKKA_ICON_DATA[binderIcon] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
+            alt: "",
+            "aria-hidden": "true",
+          },
+        });
+      }
     } else {
       setIcon(glyph, icon);
     }
@@ -304,15 +308,20 @@ class RikkaBinderView extends ItemView {
       });
       const icon = row.createSpan({ cls: "rikka-row-icon" });
       const folderIcon = this.selectedPath === item.path ? "BinderGroupWhite@2x@2x.png" : "BinderGroup@2x@2x.png";
-      const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/${folderIcon}`;
-      icon.createEl("img", {
-        cls: "rikka-scrivener-icon",
-        attr: {
-          src: RIKKA_ICON_DATA[folderIcon] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
-          alt: "",
-          "aria-hidden": "true",
-        },
-      });
+      if (Platform.isMobile) {
+        setIcon(icon, this.selectedPath === item.path ? "folder-open" : "folder");
+        icon.toggleClass("is-selected-folder", this.selectedPath === item.path);
+      } else {
+        const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/${folderIcon}`;
+        icon.createEl("img", {
+          cls: "rikka-scrivener-icon",
+          attr: {
+            src: RIKKA_ICON_DATA[folderIcon] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
+            alt: "",
+            "aria-hidden": "true",
+          },
+        });
+      }
       row.createSpan({ cls: "rikka-row-title", text: item.name });
       let clickTimer;
       row.addEventListener("click", (event) => {
@@ -341,7 +350,9 @@ class RikkaBinderView extends ItemView {
     spacer.setAttr("aria-hidden", "true");
     const icon = row.createSpan({ cls: "rikka-row-icon" });
     const fileIcon = this.plugin.iconForFile(item);
-    if (item.extension === "md" && fileIcon === "file-text") {
+    if (Platform.isMobile) {
+      setIcon(icon, fileIcon === "file-text" ? "file-text" : fileIcon);
+    } else if (item.extension === "md" && fileIcon === "file-text") {
       const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/BinderText@2x@2x.png`;
       icon.createEl("img", {
         cls: "rikka-scrivener-icon",
@@ -367,8 +378,11 @@ class RikkaBinderView extends ItemView {
     if (Number.isFinite(cachedWords)) row.createSpan({ cls: "rikka-row-wordcount", text: `${cachedWords.toLocaleString()}w` });
     row.addEventListener("click", (event) => {
       this.selectedPath = item.path;
-      this.render();
-      this.plugin.runSafely(() => this.plugin.openFile(item, event.metaKey || event.ctrlKey), "Open document");
+      const openInNewTab = !Platform.isMobile && (event.metaKey || event.ctrlKey);
+      this.plugin.runSafely(async () => {
+        await this.plugin.openFile(item, openInNewTab);
+        this.render();
+      }, "Open document");
     });
     row.addEventListener("dblclick", (event) => event.preventDefault());
   }
@@ -463,6 +477,18 @@ module.exports = class RikkaPlugin extends Plugin {
         input.addEventListener("keydown", (keyEvent) => keyEvent.stopPropagation(), { once: true });
       }
     }, true);
+    this.registerDomEvent(document, "focusin", (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || !input.matches(".base-board-add-card-input")) return;
+      input.setAttribute("inputmode", "text");
+      input.setAttribute("autocapitalize", "sentences");
+      input.setAttribute("autocomplete", "off");
+      const reveal = () => requestAnimationFrame(() => {
+        if (input.isConnected) input.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+      window.visualViewport?.addEventListener("resize", reveal, { once: true });
+      window.setTimeout(reveal, 220);
+    }, true);
     this.registerDomEvent(document, "click", (event) => {
       if (Date.now() >= this.mobileDragClickSuppression) return;
       if (!event.target?.closest?.(".base-board-card")) return;
@@ -504,7 +530,7 @@ module.exports = class RikkaPlugin extends Plugin {
             board.addClass("base-board-board--is-dragging");
             state.active = true;
             if (navigator.vibrate) navigator.vibrate(10);
-          }, 280);
+          }, 200);
         };
         const onMove = (event) => {
           if (!state) return;
@@ -792,10 +818,11 @@ module.exports = class RikkaPlugin extends Plugin {
   }
 
   async openFile(file, newTab = false, split = false) {
-    // On iPhone, the first root leaf can be the mobile sidebar itself. Opening
-    // a note there silently does nothing, so use the active content leaf.
+    // Route iPhone note navigation through Obsidian's link opener. The mobile
+    // workspace can report the Binder/sidebar as its active leaf; opening a
+    // file directly on that leaf appears to select the row without navigating.
     if (Platform.isMobile && !newTab && !split) {
-      await this.app.workspace.getLeaf(false).openFile(file);
+      await this.app.workspace.openLinkText(file.path, "", false);
       return;
     }
     // Reuse the leftmost main-workspace tab for ordinary desktop navigation.
