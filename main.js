@@ -1751,6 +1751,11 @@ module.exports = class RikkaPlugin extends Plugin {
     this.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") check(); });
     // Desktop: switching back to the Obsidian window doesn't change visibility.
     this.registerDomEvent(window, "focus", check);
+    // Opening notes is the most reliable sign of use on every device:
+    // check then too, at most every 5 minutes.
+    this.registerEvent(this.app.workspace.on("file-open", () => {
+      if (!this.lastUpdateCheck || Date.now() - this.lastUpdateCheck > 5 * 60 * 1000) check();
+    }));
     this.registerInterval(window.setInterval(check, 30 * 60 * 1000));
   }
 
