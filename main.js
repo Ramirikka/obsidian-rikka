@@ -197,6 +197,9 @@ class RikkaBinderView extends ItemView {
     this.makeToolbarButton(actions, "folder-plus", "New folder here", () => this.plugin.promptNewFolder());
     this.makeToolbarButton(actions, "more-horizontal", "More", (event) => this.plugin.showToolbarMore(event));
 
+    this.updateSlot = root.createDiv({ cls: "rikka-update-slot" });
+    this.renderUpdateButton();
+
     // Location bar: where new things will go, plus the draft word count.
     const location = root.createDiv({ cls: "rikka-target rikka-location" });
     const place = location.createDiv({ cls: "rikka-location-place" });
@@ -224,6 +227,22 @@ class RikkaBinderView extends ItemView {
       console.error("Rikka Binder render failed", error);
       root.createDiv({ cls: "rikka-error", text: `Rikka could not render the Binder: ${error?.message || error}` });
     }
+  }
+
+  renderUpdateButton() {
+    const slot = this.updateSlot;
+    if (!slot) return;
+    slot.empty();
+    const update = this.plugin.availableUpdate;
+    if (!update) return;
+    const button = slot.createEl("button", { cls: "rikka-update-button mod-cta", attr: { type: "button" } });
+    setIcon(button.createSpan({ cls: "rikka-update-icon" }), "download");
+    button.createSpan({ text: `Update Rikka to ${update.version}` });
+    button.addEventListener("click", () => {
+      button.setAttr("disabled", "true");
+      button.lastChild.setText("Updating…");
+      void this.plugin.installUpdate();
+    }, { once: true });
   }
 
   updateContextHighlight() {
@@ -771,7 +790,7 @@ module.exports = class RikkaPlugin extends Plugin {
     this.installMobileBoardSupport();
     this.installNewCardOpenGuard();
     this.installEditorFeatures();
-    this.installSelfUpdater();
+    this.installUpdateChecker();
 
     this.app.workspace.onLayoutReady(() => {
       this.validateContext();
@@ -1739,69 +1758,84 @@ module.exports = class RikkaPlugin extends Plugin {
     if (file instanceof TFolder) this.refreshViews();
   }
 
-  // ---- Self-update (requested by the vault owner) ------------------------
-  // iOS rarely restarts Obsidian, so BRAT's "update at startup" almost never
-  // runs on iPhone. Rikka checks its own GitHub releases when Obsidian opens,
-  // when it returns to the foreground, and every 30 minutes; a newer release
-  // is downloaded (from this repository only) and Rikka reloads itself.
-  installSelfUpdater() {
-    this.addCommand({ id: "check-for-update", name: "Check for Rikka update", icon: "refresh-cw", callback: () => this.checkForSelfUpdate(true) });
-    const check = () => void this.checkForSelfUpdate(false);
-    this.app.workspace.onLayoutReady(() => window.setTimeout(check, 4000));
-    this.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") check(); });
-    // Desktop: switching back to the Obsidian window doesn't change visibility.
-    this.registerDomEvent(window, "focus", check);
-    // Opening notes is the most reliable sign of use on every device:
-    // check then too, at most every 5 minutes.
-    this.registerEvent(this.app.workspace.on("file-open", () => {
-      if (!this.lastUpdateCheck || Date.now() - this.lastUpdateCheck > 5 * 60 * 1000) check();
-    }));
-    this.registerInterval(window.setInterval(check, 30 * 60 * 1000));
+  // ---- Updates: check quietly, install only when the user taps the button ----
+  // Rikka quietly checks GitHub (on launch and when returning to Obsidian, at
+  // most every 30 minutes). If a newer release exists, an "Update Rikka"
+  // button appears in the Binder. Nothing is installed until it is tapped.
+  installUpdateChecker() {
+    this.availableUpdate = null;
+    this.addCommand({ id: "update-rikka", name: "Update Rikka", icon: "download", callback: () => this.installUpdate(true) });
+    const quietCheck = () => void this.findUpdate();
+    this.app.workspace.onLayoutReady(() => window.setTimeout(quietCheck, 5000));
+    this.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") quietCheck(); });
+    this.registerInterval(window.setInterval(quietCheck, 30 * 60 * 1000));
   }
 
-  async checkForSelfUpdate(manual) {
-    if (this.selfUpdating) return;
+  // The version actually installed on disk (Obsidian keeps the version it
+  // loaded at startup in memory, which goes stale after an update).
+  async installedVersion() {
+    try {
+      const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+      return JSON.parse(await this.app.vault.adapter.read(`${dir}/manifest.json`)).version || this.manifest.version;
+    } catch (error) {
+      return this.manifest.version;
+    }
+  }
+
+  isNewer(a, b) {
+    const pa = String(a).split(".").map(Number);
+    const pb = String(b).split(".").map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+    }
+    return false;
+  }
+
+  async findUpdate(force = false) {
     const now = Date.now();
-    if (!manual && this.lastUpdateCheck && now - this.lastUpdateCheck < 60 * 1000) return;
+    if (!force && this.lastUpdateCheck && now - this.lastUpdateCheck < 30 * 60 * 1000) return this.availableUpdate;
     this.lastUpdateCheck = now;
-    this.selfUpdating = true;
     try {
       const { requestUrl } = require("obsidian");
-      // Ask GitHub for the latest release and its files. A release whose files
-      // haven't been attached yet (they arrive ~40s after publishing) is
-      // simply skipped and picked up on the next check.
       const release = (await requestUrl({ url: "https://api.github.com/repos/Ramirikka/obsidian-rikka/releases/latest", headers: { Accept: "application/vnd.github+json" } })).json;
       const asset = (name) => release?.assets?.find((a) => a.name === name)?.browser_download_url;
-      const manifestUrl = asset("manifest.json");
-      const jsUrl = asset("main.js");
-      if (!manifestUrl || !jsUrl) {
-        this.lastUpdateCheck = 0; // try again on the next trigger
-        if (manual) new Notice("A new Rikka release is still being prepared. Try again in a minute.");
+      const version = String(release?.tag_name || "").replace(/^v/, "");
+      const installed = await this.installedVersion();
+      const ready = asset("manifest.json") && asset("main.js");
+      this.availableUpdate = ready && this.isNewer(version, installed)
+        ? { version, manifest: asset("manifest.json"), main: asset("main.js"), styles: asset("styles.css") }
+        : null;
+    } catch (error) {
+      this.lastUpdateCheck = 0;
+      console.warn("Rikka update check failed", error);
+    }
+    this.getView()?.renderUpdateButton?.();
+    return this.availableUpdate;
+  }
+
+  async installUpdate(fromCommand = false) {
+    if (this.installingUpdate) return;
+    this.installingUpdate = true;
+    try {
+      const update = await this.findUpdate(true);
+      if (!update) {
+        if (fromCommand) new Notice(`Rikka is up to date (${await this.installedVersion()}).`);
         return;
       }
-      const remote = (await requestUrl({ url: manifestUrl })).json;
-      const newer = (a, b) => {
-        const pa = String(a).split(".").map(Number);
-        const pb = String(b).split(".").map(Number);
-        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-          if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
-        }
-        return false;
-      };
-      if (remote?.id !== this.manifest.id || !remote.version || !newer(remote.version, this.manifest.version)) {
-        if (manual) new Notice(`Rikka is up to date (${this.manifest.version}).`);
-        return;
-      }
-      const js = (await requestUrl({ url: jsUrl })).text;
-      const cssUrl = asset("styles.css");
-      const css = cssUrl ? await requestUrl({ url: cssUrl }).then((r) => r.text, () => null) : null;
-      // Sanity checks before touching the installed copy.
+      const { requestUrl } = require("obsidian");
+      const remote = (await requestUrl({ url: update.manifest })).json;
+      if (remote?.id !== this.manifest.id || remote.version !== update.version) throw new Error("Release files don't match");
+      const js = (await requestUrl({ url: update.main })).text;
       if (!js || js.length < 10000 || !js.includes("RikkaPlugin")) throw new Error("Downloaded update looks incomplete");
+      const css = update.styles ? await requestUrl({ url: update.styles }).then((r) => r.text, () => null) : null;
       const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
       const adapter = this.app.vault.adapter;
       await adapter.write(`${dir}/main.js`, js);
       if (css) await adapter.write(`${dir}/styles.css`, css);
       await adapter.write(`${dir}/manifest.json`, JSON.stringify(remote, null, 2));
+      // Keep Obsidian's in-memory copy in step so the new version is recognised.
+      if (this.app.plugins?.manifests?.[this.manifest.id]) this.app.plugins.manifests[this.manifest.id].version = remote.version;
+      this.availableUpdate = null;
       new Notice(`Rikka updated to ${remote.version}.`);
       const id = this.manifest.id;
       const plugins = this.app.plugins;
@@ -1810,11 +1844,10 @@ module.exports = class RikkaPlugin extends Plugin {
         await plugins.enablePlugin(id);
       }, 300);
     } catch (error) {
-      this.lastUpdateCheck = 0; // a failed check (offline, GitHub hiccup) retries next time
-      console.warn("Rikka self-update check failed", error);
-      if (manual) new Notice(`Couldn't check for updates: ${error?.message || error}`);
+      console.error("Rikka update failed", error);
+      new Notice(`Couldn't update Rikka: ${error?.message || error}`);
     } finally {
-      this.selfUpdating = false;
+      this.installingUpdate = false;
     }
   }
 

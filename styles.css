@@ -632,3 +632,14 @@ body.is-mobile .rikka-slash-row { min-height: 48px; }
 @media (prefers-reduced-motion: reduce) {
   .rikka-binder *, .rikka-slash-item * { transition: none !important; animation: none !important; }
 }
+
+/* "Update Rikka" — only shown when a newer version is available */
+.rikka-update-slot:empty { display: none; }
+.rikka-update-slot { padding: 6px 10px 2px; }
+.rikka-update-button {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  width: 100%; min-height: 32px; font-size: var(--font-ui-small);
+}
+.rikka-update-icon { display: inline-flex; }
+.rikka-update-icon svg { width: 14px; height: 14px; }
+body.is-mobile .rikka-update-button { min-height: 44px; font-size: 15px; }
