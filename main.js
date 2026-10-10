@@ -1634,7 +1634,7 @@ module.exports = class RikkaPlugin extends Plugin {
 
   async updateWordCounts() {
     const view = this.getView();
-    const container = view?.containerEl.querySelector(".rikka-target");
+    const container = view?.containerEl.querySelector(".rikka-location-words");
     if (!container) return;
     await this.renderDraftWordCount(container);
     view.containerEl.querySelectorAll(".rikka-note-row").forEach((row) => {

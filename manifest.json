@@ -1,7 +1,7 @@
 {
   "id": "rikka",
   "name": "Rikka",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "minAppVersion": "1.4.0",
   "description": "A Scrivener-inspired project Binder for LIFE2.0.",
   "author": "Rami",
