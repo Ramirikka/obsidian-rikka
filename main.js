@@ -1178,6 +1178,8 @@ module.exports = class RikkaPlugin extends Plugin {
         this.wordCountCache.set(this.replaceStoredPath(path, oldPath, newPath), value);
       }
     }
+    const view = this.getView();
+    if (view?.selectedPath && this.pathIsWithin(view.selectedPath, oldPath)) view.selectedPath = this.replaceStoredPath(view.selectedPath, oldPath, newPath);
     // Renaming/moving the current folder (here or via sync) keeps it current.
     if (this.data.context?.folder && this.pathIsWithin(this.data.context.folder, oldPath)) {
       this.data.context.folder = this.replaceStoredPath(this.data.context.folder, oldPath, newPath);
@@ -1715,7 +1717,11 @@ module.exports = class RikkaPlugin extends Plugin {
     const inResearch = this.data.research.includes(item.path);
     const currentParent = item.parent?.path === root.path ? "" : item.parent?.path;
     const choices = [];
-    const label = (path) => this.contextInfo({ section: "draft", folder: path }).path;
+    // Label each folder by where it lives in the Binder (Draft or Research).
+    const label = (path) => {
+      const inRes = this.data.research.some((root) => this.pathIsWithin(path, root));
+      return this.contextInfo({ section: inRes ? "research" : "draft", folder: path }).path;
+    };
     const mark = (text, isCurrent) => isCurrent ? `${text}  · current` : text;
     choices.push({ value: { kind: "folder", path: root.path }, label: mark("Draft (top level)", !inResearch && !currentParent) });
     const walk = (folder) => {
