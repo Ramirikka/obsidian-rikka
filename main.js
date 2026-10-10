@@ -207,7 +207,23 @@ class RikkaBinderView extends ItemView {
       event.preventDefault();
       section.removeClass("rikka-drop-target");
       const path = event.dataTransfer?.getData("text/plain");
-      if (path) this.plugin.runSafely(() => this.plugin.moveToCollection(path, key === "research" ? "research" : key === "trash" ? "trash" : "draft"), "Move document");
+      if (!path) return;
+      this.plugin.runSafely(async () => {
+        await this.plugin.moveToCollection(path, key === "research" ? "research" : key === "trash" ? "trash" : "draft");
+        // Dropping on the Draft section (not on a folder) moves the item to the project root.
+        if (key === "draft") {
+          const root = this.plugin.app.vault.getAbstractFileByPath(this.plugin.activeProject.path);
+          if (root instanceof TFolder) await this.plugin.moveIntoFolder(path, root);
+        }
+      }, "Move document");
+    });
+    section.addEventListener("contextmenu", (event) => {
+      if (key !== "draft") return;
+      event.preventDefault();
+      const menu = new Menu();
+      menu.addItem((entry) => entry.setTitle("New document").setIcon("file-plus-2").onClick(() => this.plugin.promptNewNote()));
+      menu.addItem((entry) => entry.setTitle("New folder").setIcon("folder-plus").onClick(() => this.plugin.promptNewFolder()));
+      menu.showAtMouseEvent(event);
     });
 
     const collapsed = Boolean(this.plugin.data.collapsed[`section:${key}`]);
@@ -294,8 +310,27 @@ class RikkaBinderView extends ItemView {
     });
     row.addEventListener("contextmenu", (event) => {
       event.preventDefault();
+      event.stopPropagation();
       this.plugin.showItemMenu(item, sectionKey, event);
     });
+
+    if (isFolder && sectionKey === "draft") {
+      // Drop a document or folder onto this folder to move it inside.
+      row.addEventListener("dragover", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+        row.addClass("rikka-drop-target");
+      });
+      row.addEventListener("dragleave", () => row.removeClass("rikka-drop-target"));
+      row.addEventListener("drop", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        row.removeClass("rikka-drop-target");
+        const path = event.dataTransfer?.getData("text/plain");
+        if (path) this.plugin.runSafely(() => this.plugin.moveIntoFolder(path, item), "Move into folder");
+      });
+    }
 
     if (isFolder) {
       const folderKey = `folder:${sectionKey}:${item.path}`;
@@ -430,6 +465,7 @@ module.exports = class RikkaPlugin extends Plugin {
 
     this.installBoardCreationSupport();
     this.installMobileBoardSupport();
+    this.installNewCardOpenGuard();
 
     this.app.workspace.onLayoutReady(() => this.runSafely(() => this.activateView(), "Open Rikka Binder"));
   }
@@ -484,6 +520,7 @@ module.exports = class RikkaPlugin extends Plugin {
       if (busy || !input.value.trim()) return;
       busy = true;
       input.disabled = true;
+      this.armNewCardGuard();
       try {
         await this.createBoardCard(column, input.value.trim());
         wrapper.remove();
@@ -543,6 +580,60 @@ module.exports = class RikkaPlugin extends Plugin {
     await this.app.vault.create(path, `---\n${stringifyYaml(properties).trimEnd()}\n---\n\n`);
   }
 
+  // When a card is added on a board, keep the board on screen: if anything tries
+  // to open the newly created note (or its properties) right after creation,
+  // close that and return to the board. Tapping a card later still opens it.
+  armNewCardGuard() {
+    this.newCardGuardUntil = Date.now() + 2500;
+    this.newCardBoardLeaf = this.app.workspace.getMostRecentLeaf?.() || null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view?.getViewType?.() === "base-board" || leaf.view?.file?.extension === "base") {
+        if (leaf === this.app.workspace.activeLeaf || !this.newCardBoardLeaf) this.newCardBoardLeaf = leaf;
+      }
+    });
+  }
+
+  installNewCardOpenGuard() {
+    this.newCardPaths = new Set();
+    this.newCardGuardUntil = 0;
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (Date.now() < this.newCardGuardUntil && file instanceof TFile && file.extension === "md") {
+        this.newCardPaths.add(file.path);
+        window.setTimeout(() => this.newCardPaths.delete(file.path), 2500);
+      }
+    }));
+    const restoreBoard = (leaf) => {
+      const board = this.newCardBoardLeaf;
+      if (!leaf || leaf === board) {
+        // The board's own tab navigated to the note: go back to the board.
+        leaf?.history?.back?.();
+        return;
+      }
+      leaf.detach();
+      if (board) this.app.workspace.setActiveLeaf(board, { focus: false });
+    };
+    this.registerEvent(this.app.workspace.on("file-open", (file) => {
+      if (!file || !this.newCardPaths.has(file.path)) return;
+      this.newCardPaths.delete(file.path);
+      const leaf = this.app.workspace.getMostRecentLeaf?.() || this.app.workspace.activeLeaf;
+      window.setTimeout(() => restoreBoard(leaf), 50);
+    }));
+    // Some boards open the new card in a popover/modal instead of a tab.
+    const observer = new MutationObserver(() => {
+      if (Date.now() >= this.newCardGuardUntil || !this.newCardPaths.size) return;
+      document.querySelectorAll(".modal-container, .popover.hover-popover").forEach((el) => {
+        const text = el.getAttribute("data-path") || el.querySelector("[data-path]")?.getAttribute("data-path") || "";
+        const title = el.querySelector(".inline-title, .view-header-title, .modal-title")?.textContent?.trim() || "";
+        const match = [...this.newCardPaths].some((path) => path === text || path.endsWith(`/${title}.md`));
+        if (!match) return;
+        const close = el.querySelector(".modal-close-button");
+        if (close) close.click(); else el.remove();
+      });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    this.register(() => observer.disconnect());
+  }
+
   installMobileBoardSupport() {
     if (!Platform.isMobile) return;
     this.mobileDragClickSuppression = 0;
@@ -557,6 +648,7 @@ module.exports = class RikkaPlugin extends Plugin {
       event.preventDefault();
       event.stopImmediatePropagation();
       this.mobileDragClickSuppression = Date.now() + 1200;
+      this.armNewCardGuard();
       input.blur();
     }, true);
     this.registerDomEvent(document, "focusin", (event) => {
@@ -1046,24 +1138,8 @@ module.exports = class RikkaPlugin extends Plugin {
       if (!Number.isFinite(count) || row.querySelector(".rikka-row-wordcount")) return;
       row.createSpan({ cls: "rikka-row-wordcount", text: `${count.toLocaleString()}w` });
     });
-    const target = Number(this.data.wordTarget) || 0;
-    const label = container.createSpan({ cls: "rikka-target-label", text: target ? `${words.toLocaleString()} / ${target.toLocaleString()} words` : `${words.toLocaleString()} draft words` });
+    const label = container.createSpan({ cls: "rikka-target-label", text: `${words.toLocaleString()} draft words` });
     label.setAttr("aria-live", "polite");
-    if (target) {
-      const track = container.createDiv({ cls: "rikka-target-track" });
-      const fill = track.createDiv({ cls: "rikka-target-fill" });
-      fill.style.width = `${Math.min(100, Math.round((words / target) * 100))}%`;
-    }
-    const button = container.createEl("button", { cls: "rikka-target-button", text: target ? "Edit target" : "Set target" });
-    button.addEventListener("click", () => new RikkaNameModal(this.app, "Draft word target", "For example: 10000", async (value) => {
-      const parsed = Number(value.replace(/,/g, "").trim());
-      if (!Number.isSafeInteger(parsed) || parsed < 1) {
-        new Notice("Enter a word target greater than zero.");
-        return;
-      }
-      this.data.wordTarget = parsed;
-      await this.saveState();
-    }).open());
   }
 
   promptNewFromTemplate() {
@@ -1175,6 +1251,40 @@ module.exports = class RikkaPlugin extends Plugin {
     }).open();
   }
 
+  async moveIntoFolder(path, folder) {
+    const item = this.app.vault.getAbstractFileByPath(path);
+    if (!item || !(folder instanceof TFolder)) return;
+    if (item === folder || item.parent === folder) return;
+    if (item instanceof TFolder && (folder.path === item.path || folder.path.startsWith(`${item.path}/`))) {
+      new Notice("Can't move a folder inside itself.");
+      return;
+    }
+    const target = `${folder.path}/${item.name}`;
+    if (this.app.vault.getAbstractFileByPath(target)) {
+      new Notice(`"${item.name}" already exists in ${folder.name}.`);
+      return;
+    }
+    await this.app.fileManager.renameFile(item, target);
+    this.refreshViews();
+  }
+
+  promptMoveToFolder(item) {
+    const root = this.app.vault.getAbstractFileByPath(this.activeProject.path);
+    if (!(root instanceof TFolder)) return;
+    const folders = [];
+    const walk = (folder) => {
+      if (item instanceof TFolder && (folder.path === item.path || folder.path.startsWith(`${item.path}/`))) return;
+      folders.push(folder);
+      for (const child of folder.children) if (child instanceof TFolder) walk(child);
+    };
+    walk(root);
+    const choices = folders
+      .filter((folder) => folder !== item.parent)
+      .map((folder) => ({ value: folder.path, label: folder === root ? "Draft (top level)" : folder.path.slice(root.path.length + 1) }));
+    new RikkaChoiceModal(this.app, `Move · ${item.name}`, choices, (path) => this.runSafely(
+      () => this.moveIntoFolder(item.path, this.app.vault.getAbstractFileByPath(path)), "Move to folder")).open();
+  }
+
   safeName(value) {
     return value.replace(/[\\/:*?"<>|]/g, "—").replace(/[. ]+$/g, "").trim();
   }
@@ -1240,7 +1350,13 @@ module.exports = class RikkaPlugin extends Plugin {
       if (item instanceof TFolder) {
         menu.addItem((entry) => entry.setTitle("New document inside").setIcon("file-plus-2").onClick(() => this.promptNewNote(item.path)));
         menu.addItem((entry) => entry.setTitle("New folder inside").setIcon("folder-plus").onClick(() => this.promptNewFolder(item.path)));
+      } else {
+        const parentPath = item.parent?.path && item.parent.path !== "/" ? item.parent.path : "";
+        menu.addItem((entry) => entry.setTitle("New document here").setIcon("file-plus-2").onClick(() => this.promptNewNote(parentPath)));
+        menu.addItem((entry) => entry.setTitle("New folder here").setIcon("folder-plus").onClick(() => this.promptNewFolder(parentPath)));
       }
+      menu.addItem((entry) => entry.setTitle("Move to folder…").setIcon("folder-input").onClick(() => this.promptMoveToFolder(item)));
+      menu.addSeparator();
       menu.addItem((entry) => entry.setTitle("Move to Research").setIcon("library").onClick(() => this.runSafely(() => this.moveToCollection(item.path, "research"), "Move to Research")));
       menu.addItem((entry) => entry.setTitle("Move to Rikka Trash").setIcon("trash-2").onClick(() => this.runSafely(() => this.moveToCollection(item.path, "trash"), "Move to Rikka Trash")));
     }

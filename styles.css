@@ -488,3 +488,10 @@
   font-weight: 400;
 }
 body.is-mobile .rikka-board-card-input { font-size: 16px !important; }
+
+/* Folder rows highlight when a document is dragged over them */
+.rikka-row.rikka-folder-row.rikka-drop-target {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-radius: 6px;
+}
