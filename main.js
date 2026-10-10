@@ -540,7 +540,7 @@ module.exports = class RikkaPlugin extends Plugin {
     }
     // Creating through the vault keeps Bases from opening the new note/properties.
     // The board refreshes from the normal vault event while its tab stays active.
-    await this.app.vault.create(path, `---\n${stringifyYaml(properties)}---\n\n`);
+    await this.app.vault.create(path, `---\n${stringifyYaml(properties).trimEnd()}\n---\n\n`);
   }
 
   installMobileBoardSupport() {
