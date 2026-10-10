@@ -186,6 +186,18 @@ class RikkaBinderView extends ItemView {
     button.addEventListener("click", () => this.plugin.runSafely(callback, label));
   }
 
+  appendBinderImage(parent, name) {
+    const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/${name}`;
+    parent.createEl("img", {
+      cls: "rikka-scrivener-icon",
+      attr: {
+        src: RIKKA_ICON_DATA[name] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
+        alt: "",
+        "aria-hidden": "true",
+      },
+    });
+  }
+
   renderSection(parent, key, label, icon, items, emptyText) {
     const section = parent.createDiv({ cls: "rikka-section" });
     section.dataset.section = key;
@@ -208,19 +220,7 @@ class RikkaBinderView extends ItemView {
       : key === "trash" ? `${items.length ? "BinderTrashFull" : "BinderTrashEmpty"}@2x@2x.png`
       : null;
     if (binderIcon) {
-      if (Platform.isMobile) {
-        setIcon(glyph, key === "draft" ? "folder-open" : key === "research" ? "library" : "trash-2");
-      } else {
-        const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/${binderIcon}`;
-        glyph.createEl("img", {
-          cls: "rikka-scrivener-icon",
-          attr: {
-            src: RIKKA_ICON_DATA[binderIcon] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
-            alt: "",
-            "aria-hidden": "true",
-          },
-        });
-      }
+      this.appendBinderImage(glyph, binderIcon);
     } else {
       setIcon(glyph, icon);
     }
@@ -308,20 +308,7 @@ class RikkaBinderView extends ItemView {
       });
       const icon = row.createSpan({ cls: "rikka-row-icon" });
       const folderIcon = this.selectedPath === item.path ? "BinderGroupWhite@2x@2x.png" : "BinderGroup@2x@2x.png";
-      if (Platform.isMobile) {
-        setIcon(icon, this.selectedPath === item.path ? "folder-open" : "folder");
-        icon.toggleClass("is-selected-folder", this.selectedPath === item.path);
-      } else {
-        const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/${folderIcon}`;
-        icon.createEl("img", {
-          cls: "rikka-scrivener-icon",
-          attr: {
-            src: RIKKA_ICON_DATA[folderIcon] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
-            alt: "",
-            "aria-hidden": "true",
-          },
-        });
-      }
+      this.appendBinderImage(icon, folderIcon);
       row.createSpan({ cls: "rikka-row-title", text: item.name });
       let clickTimer;
       row.addEventListener("click", (event) => {
@@ -350,18 +337,8 @@ class RikkaBinderView extends ItemView {
     spacer.setAttr("aria-hidden", "true");
     const icon = row.createSpan({ cls: "rikka-row-icon" });
     const fileIcon = this.plugin.iconForFile(item);
-    if (Platform.isMobile) {
-      setIcon(icon, fileIcon === "file-text" ? "file-text" : fileIcon);
-    } else if (item.extension === "md" && fileIcon === "file-text") {
-      const iconPath = `${this.plugin.app.vault.configDir}/plugins/rikka/assets/BinderText@2x@2x.png`;
-      icon.createEl("img", {
-        cls: "rikka-scrivener-icon",
-        attr: {
-          src: RIKKA_ICON_DATA["BinderText@2x@2x.png"] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
-          alt: "",
-          "aria-hidden": "true",
-        },
-      });
+    if (item.extension === "md" && fileIcon === "file-text") {
+      this.appendBinderImage(icon, "BinderText@2x@2x.png");
     } else {
       setIcon(icon, fileIcon);
     }
@@ -472,6 +449,7 @@ module.exports = class RikkaPlugin extends Plugin {
       const input = event.target;
       if (!(input instanceof HTMLInputElement) || !input.matches(".base-board-add-card-input")) return;
       if (event.key === "Enter" || event.key === "Escape") {
+        if (event.key === "Enter") this.mobileDragClickSuppression = Date.now() + 1000;
         // Let Base Board's own input handler commit/cancel first, then keep the
         // key from reaching Obsidian's page-level shortcuts after it removes the input.
         input.addEventListener("keydown", (keyEvent) => keyEvent.stopPropagation(), { once: true });
@@ -483,11 +461,6 @@ module.exports = class RikkaPlugin extends Plugin {
       input.setAttribute("inputmode", "text");
       input.setAttribute("autocapitalize", "sentences");
       input.setAttribute("autocomplete", "off");
-      const reveal = () => requestAnimationFrame(() => {
-        if (input.isConnected) input.scrollIntoView({ block: "nearest", inline: "nearest" });
-      });
-      window.visualViewport?.addEventListener("resize", reveal, { once: true });
-      window.setTimeout(reveal, 220);
     }, true);
     this.registerDomEvent(document, "click", (event) => {
       if (Date.now() >= this.mobileDragClickSuppression) return;
@@ -530,7 +503,7 @@ module.exports = class RikkaPlugin extends Plugin {
             board.addClass("base-board-board--is-dragging");
             state.active = true;
             if (navigator.vibrate) navigator.vibrate(10);
-          }, 200);
+          }, 120);
         };
         const onMove = (event) => {
           if (!state) return;
@@ -539,7 +512,7 @@ module.exports = class RikkaPlugin extends Plugin {
           state.lastX = touch.clientX;
           state.lastY = touch.clientY;
           if (!state.active) {
-            if (Math.hypot(touch.clientX - state.x, touch.clientY - state.y) > 9) clearPending();
+            if (Math.hypot(touch.clientX - state.x, touch.clientY - state.y) > 18) clearPending();
             return;
           }
           event.preventDefault();
@@ -818,15 +791,8 @@ module.exports = class RikkaPlugin extends Plugin {
   }
 
   async openFile(file, newTab = false, split = false) {
-    // Route iPhone note navigation through Obsidian's link opener. The mobile
-    // workspace can report the Binder/sidebar as its active leaf; opening a
-    // file directly on that leaf appears to select the row without navigating.
-    if (Platform.isMobile && !newTab && !split) {
-      await this.app.workspace.openLinkText(file.path, "", false);
-      return;
-    }
-    // Reuse the leftmost main-workspace tab for ordinary desktop navigation.
-    // Explicit tab and split commands leave the current document visible.
+    // Reuse the leftmost main-workspace tab for ordinary navigation, including
+    // on mobile where the active leaf can be the Binder in the left sidebar.
     let firstLeaf = null;
     this.app.workspace.iterateRootLeaves((candidate) => {
       if (!firstLeaf) firstLeaf = candidate;
@@ -837,6 +803,10 @@ module.exports = class RikkaPlugin extends Plugin {
         ? this.app.workspace.getLeaf("tab")
         : firstLeaf || this.app.workspace.getLeaf(false);
     await leaf.openFile(file);
+    if (Platform.isMobile && !newTab && !split) {
+      this.app.workspace.setActiveLeaf(leaf, { focus: true });
+      this.app.workspace.leftSplit?.collapse();
+    }
   }
 
   async setFileProperty(file, key, value) {
