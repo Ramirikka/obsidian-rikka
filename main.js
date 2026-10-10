@@ -1,4 +1,4 @@
-const { FuzzySuggestModal, ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon, parseYaml, stringifyYaml } = require("obsidian");
+const { EditorSuggest, FuzzySuggestModal, ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon, parseYaml, stringifyYaml } = require("obsidian");
 
 const VIEW_TYPE = "rikka-binder";
 const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [], context: { section: "draft", folder: "" } };
@@ -83,6 +83,7 @@ class RikkaNameModal extends Modal {
     this.buttonText = options.buttonText || "Create";
     this.subtitle = options.subtitle || "";
     this.draftKey = options.draftKey || "";
+    this.inputType = options.inputType || "text";
     this.value = options.initialValue || (this.draftKey && RIKKA_NAME_DRAFTS.get(this.draftKey)) || "";
     this.submitted = false;
   }
@@ -94,7 +95,7 @@ class RikkaNameModal extends Modal {
     const form = this.contentEl.createEl("form", { cls: "rikka-name-modal-form" });
     this.inputEl = form.createEl("input", {
       cls: "rikka-name-modal-input",
-      attr: { type: "text", placeholder: this.placeholder, enterkeyhint: "done", autocapitalize: "sentences", autocomplete: "off", spellcheck: "false" },
+      attr: { type: this.inputType, placeholder: this.placeholder, enterkeyhint: "done", autocapitalize: this.inputType === "url" ? "off" : "sentences", autocomplete: "off", spellcheck: "false" },
     });
     this.inputEl.value = this.value;
     this.inputEl.addEventListener("input", () => { this.value = this.inputEl.value; });
@@ -104,6 +105,8 @@ class RikkaNameModal extends Modal {
       void this.submit();
     });
     this.buttonEl = button;
+    this.noticeEl = this.contentEl.createDiv({ cls: "rikka-name-modal-notice" });
+    this.setNotice = (text) => this.noticeEl.setText(text);
     window.setTimeout(() => { this.inputEl.focus(); this.inputEl.select(); }, 0);
   }
 
@@ -115,7 +118,16 @@ class RikkaNameModal extends Modal {
     this.buttonEl?.setAttr("disabled", "true");
     try {
       const result = await this.onSubmit(name);
-      if (result === false) { this.inputEl?.focus(); return; } // e.g. duplicate name: let them edit
+      if (result === false) { this.inputEl?.focus(); return; } // invalid: let them edit
+      if (typeof result === "string") {
+        // Name taken: propose the next free one ("Notes 2"); never overwrite.
+        this.value = result;
+        this.inputEl.value = result;
+        this.inputEl.focus();
+        this.inputEl.select();
+        this.setNotice?.(`That name is taken — use “${result}”?`);
+        return;
+      }
       this.submitted = true;
       if (this.draftKey) RIKKA_NAME_DRAFTS.delete(this.draftKey);
       this.inputEl?.blur(); // dismiss the keyboard before the dialog closes
@@ -446,6 +458,16 @@ class RikkaBinderView extends ItemView {
         children.style.setProperty("--rikka-depth", String(depth + 1));
         const visibleChildren = this.plugin.getVisibleChildren(item, sectionKey);
         for (const child of visibleChildren) this.renderNode(children, child, depth + 1, sectionKey);
+        if (!visibleChildren.length && sectionKey !== "trash") {
+          const empty = children.createDiv({ cls: "rikka-empty rikka-folder-empty" });
+          empty.style.setProperty("--rikka-depth", String(depth + 1));
+          empty.createSpan({ text: "No documents yet · " });
+          const add = empty.createEl("button", { cls: "rikka-link-button", text: "New document", attr: { type: "button" } });
+          add.addEventListener("click", (event) => {
+            event.stopPropagation();
+            this.plugin.promptNewNote({ section: sectionKey, folder: item.path });
+          });
+        }
       }
       return;
     }
@@ -477,6 +499,181 @@ class RikkaBinderView extends ItemView {
       this.plugin.runSafely(() => this.plugin.openFile(item, openInNewTab), "Open document");
     });
     row.addEventListener("dblclick", (event) => event.preventDefault());
+  }
+}
+
+// ===========================================================================
+// Editor: "/" and "@" menus and block-style actions, built on Obsidian's
+// EditorSuggest so they position near the caret, stay above the iPhone
+// keyboard and support arrow keys / Enter / Escape natively.
+// Every edit is one editor.transaction() => one undo step, plain Markdown.
+// ===========================================================================
+
+// Is the caret somewhere a command menu would be unwelcome?
+// (fenced code, frontmatter, inline code, math)
+function rikkaInCodeContext(editor, line, ch) {
+  let fenced = false;
+  let inFrontmatter = false;
+  for (let i = 0; i < line; i++) {
+    const text = editor.getLine(i);
+    if (i === 0 && /^---\s*$/.test(text)) { inFrontmatter = true; continue; }
+    if (inFrontmatter) { if (/^---\s*$/.test(text)) inFrontmatter = false; continue; }
+    if (/^\s*(```|~~~)/.test(text)) fenced = !fenced;
+  }
+  if (fenced || inFrontmatter) return true;
+  const before = editor.getLine(line).slice(0, ch);
+  if ((before.match(/`/g) || []).length % 2 === 1) return true;
+  if ((before.match(/(?<!\\)\$/g) || []).length % 2 === 1) return true;
+  return false;
+}
+
+// Line prefixes we treat as "block markers" (indent, list, task, quote, heading).
+const RIKKA_PREFIX_RE = /^(\s*)(?:(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?|>\s?|#{1,6}\s+)?/;
+
+function rikkaFuzzy(query, text) {
+  if (!query) return 1;
+  const q = query.toLowerCase();
+  const t = text.toLowerCase();
+  if (t.startsWith(q)) return 3;
+  if (t.split(/[\s-]+/).some((word) => word.startsWith(q))) return 2.5;
+  if (t.includes(q)) return 2;
+  let i = 0;
+  for (const c of t) if (c === q[i]) i++;
+  return i === q.length ? 1 : 0;
+}
+
+class RikkaSlashSuggest extends EditorSuggest {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.limit = 40;
+    this.setInstructions?.([
+      { command: "↑↓", purpose: "to navigate" },
+      { command: "↵", purpose: "to insert" },
+      { command: "esc", purpose: "to dismiss" },
+    ]);
+  }
+
+  onTrigger(cursor, editor) {
+    const before = editor.getLine(cursor.line).slice(0, cursor.ch);
+    // "/" must start a block (after indent/list/quote markers) or follow a space,
+    // so URLs (https://a/b), paths (src/x) and fractions (1/2) never trigger it.
+    const match = before.match(/(^|\s)\/([\p{L}\p{N}#]*)$/u);
+    if (!match) return null;
+    if (match[2].length > 24) return null;
+    const start = cursor.ch - match[2].length - 1;
+    if (rikkaInCodeContext(editor, cursor.line, start)) return null;
+    return { start: { line: cursor.line, ch: start }, end: cursor, query: match[2] };
+  }
+
+  getSuggestions(context) {
+    const query = context.query.trim();
+    const items = this.plugin.slashCommands();
+    if (!query) return items;
+    return items
+      .map((item) => {
+        const score = Math.max(
+          rikkaFuzzy(query, item.title) * 2,
+          ...item.aliases.map((alias) => rikkaFuzzy(query, alias) * 1.8),
+          rikkaFuzzy(query, item.description) * 0.5,
+        );
+        return { item, score };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((entry) => entry.item);
+  }
+
+  renderSuggestion(item, el) {
+    el.addClass("rikka-slash-item");
+    if (item.firstInGroup && !this.context?.query) el.createDiv({ cls: "rikka-slash-group", text: item.group });
+    const row = el.createDiv({ cls: "rikka-slash-row" });
+    const icon = row.createDiv({ cls: "rikka-slash-icon" });
+    setIcon(icon, item.icon);
+    const text = row.createDiv({ cls: "rikka-slash-text" });
+    text.createDiv({ cls: "rikka-slash-title", text: item.title });
+    text.createDiv({ cls: "rikka-slash-desc", text: item.description });
+  }
+
+  selectSuggestion(item) {
+    const context = this.context;
+    if (!context) return;
+    const { editor, start, end, file } = context;
+    this.close();
+    // The typed "/query" is removed in the same transaction as the command's
+    // own change wherever possible, so one Undo restores the line.
+    Promise.resolve(item.run({ editor, from: start, to: end, file })).catch((error) => {
+      console.error("Rikka slash command failed", error);
+      new Notice(`${item.title} failed: ${error?.message || error}`);
+    });
+  }
+}
+
+class RikkaMentionSuggest extends EditorSuggest {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.limit = 30;
+  }
+
+  onTrigger(cursor, editor) {
+    const before = editor.getLine(cursor.line).slice(0, cursor.ch);
+    // "@" after a space or at line start (never inside emails like a@b.com).
+    const match = before.match(/(^|\s)@([^\s@\[\]]{0,40})$/u);
+    if (!match) return null;
+    const start = cursor.ch - match[2].length - 1;
+    if (rikkaInCodeContext(editor, cursor.line, start)) return null;
+    return { start: { line: cursor.line, ch: start }, end: cursor, query: match[2] };
+  }
+
+  getSuggestions(context) {
+    const query = context.query.toLowerCase();
+    const m = window.moment;
+    const dates = [
+      { kind: "date", title: "Today", date: m(), aliases: ["today", "now", "date"] },
+      { kind: "date", title: "Tomorrow", date: m().add(1, "day"), aliases: ["tomorrow"] },
+      { kind: "date", title: "Yesterday", date: m().subtract(1, "day"), aliases: ["yesterday"] },
+    ];
+    const weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+    for (const [i, day] of weekdays.entries()) {
+      if (query.length >= 2 && day.startsWith(query)) {
+        const target = m().isoWeekday(i + 1);
+        if (target.isSameOrBefore(m(), "day")) target.add(1, "week");
+        dates.push({ kind: "date", title: `Next ${day[0].toUpperCase()}${day.slice(1)}`, date: target, aliases: [day] });
+      }
+    }
+    const dateHits = dates.filter((d) => !query || d.aliases.some((a) => a.startsWith(query)) || d.title.toLowerCase().includes(query));
+    // Notes: Obsidian's in-memory file list (no disk reads, cheap per keystroke).
+    const notes = [];
+    if (query) {
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        const score = rikkaFuzzy(query, file.basename);
+        if (score >= 2) notes.push({ kind: "note", title: file.basename, file, score, path: file.parent?.path || "" });
+        if (notes.length > 200) break;
+      }
+      notes.sort((a, b) => b.score - a.score || a.title.length - b.title.length);
+    }
+    return [...dateHits, ...notes.slice(0, 20)];
+  }
+
+  renderSuggestion(item, el) {
+    el.addClass("rikka-slash-item");
+    const row = el.createDiv({ cls: "rikka-slash-row" });
+    setIcon(row.createDiv({ cls: "rikka-slash-icon" }), item.kind === "date" ? "calendar" : "file-text");
+    const text = row.createDiv({ cls: "rikka-slash-text" });
+    text.createDiv({ cls: "rikka-slash-title", text: item.title });
+    text.createDiv({ cls: "rikka-slash-desc", text: item.kind === "date" ? item.date.format("dddd, D MMMM YYYY") : (item.path === "/" ? "" : item.path) });
+  }
+
+  selectSuggestion(item) {
+    const context = this.context;
+    if (!context) return;
+    const { editor, start, end, file } = context;
+    this.close();
+    const text = item.kind === "date"
+      ? item.date.format("YYYY-MM-DD")
+      : this.app.fileManager.generateMarkdownLink(item.file, file?.path || "");
+    editor.transaction({ changes: [{ from: start, to: end, text }], selection: { from: { line: start.line, ch: start.ch + text.length } } });
   }
 }
 
@@ -527,11 +724,19 @@ module.exports = class RikkaPlugin extends Plugin {
       if (this.isInActiveProject(file.path)) this.refreshViews();
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
-      if (Platform.isMobile && file instanceof TFile && this.isInActiveProject(file.path)) {
-        window.setTimeout(() => {
-          const leaf = this.app.workspace.getMostRecentLeaf?.();
-          if (leaf?.view?.getViewType?.() === "empty") this.runSafely(() => this.activateView(), "Show Binder");
-        }, 150);
+      // Deleting the page you're looking at returns you to where you came
+      // from (the board for a card, the previous page), or on mobile to the
+      // Binder at your current location — never a blank pane.
+      if (file instanceof TFile) {
+        const leaves = [];
+        this.app.workspace.iterateRootLeaves((leaf) => { if (this.leafFiles.get(leaf) === file.path) leaves.push(leaf); });
+        if (leaves.length) window.setTimeout(() => {
+          for (const leaf of leaves) {
+            if (leaf.view?.getViewType?.() !== "empty" && leaf.view?.file) continue;
+            if (leaf.history?.backHistory?.length) leaf.history.back();
+            else if (Platform.isMobile) this.runSafely(() => this.activateView(), "Show Binder");
+          }
+        }, 120);
       }
       void this.removeStoredPath(file.path).catch((error) => {
         console.error("Rikka cleanup after deletion failed", error);
@@ -554,13 +759,18 @@ module.exports = class RikkaPlugin extends Plugin {
       this.refreshTimer = window.setTimeout(() => this.updateWordCounts(), 1200);
     }));
 
+    // Which file each tab shows, so deleting it can navigate sensibly.
+    this.leafFiles = new WeakMap();
     this.registerEvent(this.app.workspace.on("file-open", (file) => {
+      const leaf = this.app.workspace.getMostRecentLeaf?.();
+      if (leaf && file) this.leafFiles.set(leaf, file.path);
       if (file && this.isInActiveProject(file.path)) this.getView()?.setSelected(file.path);
     }));
 
     this.installBoardCreationSupport();
     this.installMobileBoardSupport();
     this.installNewCardOpenGuard();
+    this.installEditorFeatures();
 
     this.app.workspace.onLayoutReady(() => {
       this.validateContext();
@@ -852,6 +1062,11 @@ module.exports = class RikkaPlugin extends Plugin {
         return this.app.fileManager.processFrontMatter(file, (fm) => { fm[info.groupProperty] = name; });
       }).open();
     }, "Move to column")));
+    menu.addItem((entry) => entry.setTitle("Duplicate").setIcon("copy").onClick(safe(async () => {
+      const parent = file.parent?.path && file.parent.path !== "/" ? file.parent.path : "";
+      const copy = await this.app.vault.copy(file, this.availablePath(parent, `${file.basename} copy`, file.extension));
+      new Notice(`Duplicated as “${copy.basename}”.`);
+    }, "Duplicate card")));
     menu.addSeparator();
     menu.addItem((entry) => entry.setTitle("Delete").setIcon("trash-2").setWarning(true).onClick(safe(async () => {
       // Uses Obsidian's own trash setting (system trash or .trash), so it's recoverable.
@@ -1460,8 +1675,7 @@ module.exports = class RikkaPlugin extends Plugin {
         if (!safe) return false;
         const targetPath = `${info.targetPath}/${safe}.md`;
         if (this.app.vault.getAbstractFileByPath(targetPath)) {
-          new Notice(`“${safe}” already exists in ${info.name}.`);
-          return false;
+          return this.availablePath(info.targetPath, safe, "md").split("/").pop().replace(/\.md$/, "");
         }
         const content = await this.app.vault.cachedRead(template);
         const created = await this.app.vault.create(targetPath, content);
@@ -1523,6 +1737,479 @@ module.exports = class RikkaPlugin extends Plugin {
   async openFolder(folder) {
     const file = this.app.vault.getAbstractFileByPath(folder.path);
     if (file instanceof TFolder) this.refreshViews();
+  }
+
+  // ---- Editor features -----------------------------------------------------
+
+  installEditorFeatures() {
+    this.registerEditorSuggest(new RikkaSlashSuggest(this));
+    this.registerEditorSuggest(new RikkaMentionSuggest(this));
+
+    // Paste a URL over selected text => [text](url). Only when the selection is
+    // plain text on one line and the clipboard is exactly one URL.
+    this.registerEvent(this.app.workspace.on("editor-paste", (event, editor) => {
+      if (event.defaultPrevented) return;
+      const selection = editor.getSelection();
+      const pasted = event.clipboardData?.getData("text/plain")?.trim() || "";
+      if (!selection || selection.includes("\n") || /^\s*$/.test(selection)) return;
+      if (!/^(https?:\/\/|obsidian:\/\/|mailto:)[^\s]+$/i.test(pasted)) return;
+      if (/^\[.*\]\(.*\)$/.test(selection) || /^https?:\/\//i.test(selection)) return;
+      const cursor = editor.getCursor("from");
+      if (rikkaInCodeContext(editor, cursor.line, cursor.ch)) return;
+      event.preventDefault();
+      editor.replaceSelection(`[${selection.replace(/([\[\]])/g, "\\$1")}](${pasted.replace(/\)/g, "%29")})`);
+    }));
+
+    // "[] " or "[ ] " at the start of a line => "- [ ] " (task). Other Markdown
+    // shortcuts (#, -, 1., >) are native to Obsidian and left untouched.
+    this.registerEvent(this.app.workspace.on("editor-change", (editor) => {
+      const cursor = editor.getCursor();
+      const before = editor.getLine(cursor.line).slice(0, cursor.ch);
+      const match = before.match(/^(\s*)\[ ?\] $/);
+      if (!match || rikkaInCodeContext(editor, cursor.line, 0)) return;
+      editor.transaction({
+        changes: [{ from: { line: cursor.line, ch: 0 }, to: cursor, text: `${match[1]}- [ ] ` }],
+        selection: { from: { line: cursor.line, ch: match[1].length + 6 } },
+      });
+    }));
+
+    // Passive selection word count in the status bar (desktop).
+    if (!Platform.isMobile) {
+      const status = this.addStatusBarItem();
+      status.addClass("rikka-selection-count");
+      let timer = 0;
+      const update = () => {
+        const editor = this.app.workspace.activeEditor?.editor;
+        const text = editor?.getSelection() || "";
+        if (!text.trim()) { status.setText(""); status.hide(); return; }
+        const words = (text.match(/[\p{L}\p{N}][\p{L}\p{N}'’_-]*/gu) || []).length;
+        status.setText(`${words.toLocaleString()} ${words === 1 ? "word" : "words"} · ${text.length.toLocaleString()} characters selected`);
+        status.show();
+      };
+      status.hide();
+      this.registerDomEvent(document, "selectionchange", () => {
+        window.clearTimeout(timer);
+        timer = window.setTimeout(update, 120);
+      });
+    }
+
+    // Commands (assignable hotkeys; addable to the mobile toolbar in
+    // Settings → Mobile). No default hotkeys, so nothing native is hijacked.
+    const edit = (id, name, icon, fn) => this.addCommand({ id, name, icon, editorCallback: (editor, ctx) => fn(editor, ctx) });
+    const cursorRange = (editor) => { const c = editor.getCursor(); return { from: c, to: c }; };
+    edit("block-text", "Turn into text", "pilcrow", (e) => this.setLineKind(e, cursorRange(e), "text"));
+    edit("block-h1", "Turn into heading 1", "heading-1", (e) => this.setLineKind(e, cursorRange(e), "h1"));
+    edit("block-h2", "Turn into heading 2", "heading-2", (e) => this.setLineKind(e, cursorRange(e), "h2"));
+    edit("block-h3", "Turn into heading 3", "heading-3", (e) => this.setLineKind(e, cursorRange(e), "h3"));
+    edit("block-todo", "Turn into to-do", "check-square", (e) => this.setLineKind(e, cursorRange(e), "todo"));
+    edit("block-bullet", "Turn into bullet list", "list", (e) => this.setLineKind(e, cursorRange(e), "bullet"));
+    edit("block-numbered", "Turn into numbered list", "list-ordered", (e) => this.setLineKind(e, cursorRange(e), "numbered"));
+    edit("block-quote", "Turn into quote", "quote", (e) => this.setLineKind(e, cursorRange(e), "quote"));
+    edit("block-code", "Insert code block", "code-2", (e) => this.insertBlock(e, cursorRange(e), "```\n", "\n```", ""));
+    edit("block-duplicate", "Duplicate block", "copy", (e) => this.duplicateBlock(e));
+    edit("block-delete", "Delete block", "trash", (e) => this.deleteBlock(e));
+    edit("block-move-up", "Move block up", "arrow-up", (e) => this.moveBlock(e, -1));
+    edit("block-move-down", "Move block down", "arrow-down", (e) => this.moveBlock(e, 1));
+    edit("toggle-strikethrough", "Toggle strikethrough", "strikethrough", (e) => this.toggleWrap(e, "~~", "~~"));
+    edit("toggle-underline", "Toggle underline", "underline", (e) => this.toggleWrap(e, "<u>", "</u>"));
+    edit("toggle-inline-code", "Toggle inline code", "code", (e) => this.toggleWrap(e, "`", "`"));
+    edit("insert-link", "Insert link to note", "link", (e) => { const c = e.getCursor(); e.transaction({ changes: [{ from: c, to: c, text: "[[" }], selection: { from: { line: c.line, ch: c.ch + 2 } } }); });
+    edit("open-slash-menu", "Open insert menu (/)", "plus-circle", (e) => {
+      const c = e.getCursor();
+      const before = e.getLine(c.line).slice(0, c.ch);
+      const text = before === "" || /\s$/.test(before) ? "/" : " /";
+      e.transaction({ changes: [{ from: c, to: c, text }], selection: { from: { line: c.line, ch: c.ch + text.length } } });
+    });
+    edit("indent", "Indent list item", "indent", (e) => this.shiftIndent(e, 1));
+    edit("outdent", "Outdent list item", "outdent", (e) => this.shiftIndent(e, -1));
+  }
+
+  // All "/" commands. Groups appear in this order when the menu first opens.
+  slashCommands() {
+    if (this._slashCommands) return this._slashCommands;
+    const line = (kind) => ({ editor, from, to }) => this.setLineKind(editor, { from, to }, kind);
+    const block = (open, close = "", middle = "") => ({ editor, from, to }) => this.insertBlock(editor, { from, to }, open, close, middle);
+    const attach = (accept, embed) => ({ editor, from, to, file }) => this.pickAttachment(editor, { from, to }, file, accept, embed);
+    const groups = [
+      ["Basic", [
+        ["Text", "pilcrow", "Plain paragraph", ["text", "plain", "paragraph", "p"], line("text")],
+        ["Heading 1", "heading-1", "Large section heading", ["h1", "heading1", "#", "title"], line("h1")],
+        ["Heading 2", "heading-2", "Medium section heading", ["h2", "heading2", "##", "subtitle"], line("h2")],
+        ["Heading 3", "heading-3", "Small section heading", ["h3", "heading3", "###"], line("h3")],
+        ["Bullet list", "list", "Simple bulleted list", ["bullet", "bullets", "unordered", "list", "ul"], line("bullet")],
+        ["Numbered list", "list-ordered", "List with numbers", ["num", "number", "numbered", "ordered", "ol"], line("numbered")],
+        ["To-do", "check-square", "Track a task", ["todo", "task", "checkbox", "check"], line("todo")],
+        ["Toggle", "chevron-right", "Collapsible section (folded callout)", ["toggle", "collapse", "fold", "details"], block("> [!note]- ", "\n> ", "Title")],
+        ["Quote", "quote", "Capture a quote", ["quote", "blockquote", "cite"], line("quote")],
+        ["Divider", "minus", "Visually separate sections", ["divider", "div", "line", "hr", "separator", "---"], ({ editor, from, to }) => this.insertDivider(editor, { from, to })],
+      ]],
+      ["Insert", [
+        ["Page", "file-plus-2", "New page here, linked", ["page", "new", "document", "doc", "note"], ({ editor, from, to, file }) => this.slashNewPage(editor, { from, to }, file)],
+        ["Link to page", "link", "Link an existing note", ["link", "wikilink", "mention", "[["], ({ editor, from, to }) => editor.transaction({ changes: [{ from, to, text: "[[" }], selection: { from: { line: from.line, ch: from.ch + 2 } } })],
+        ["Image", "image", "Photo, camera or image file", ["image", "img", "photo", "picture", "camera"], attach("image/*", true)],
+        ["File", "paperclip", "Attach any file", ["file", "attach", "attachment", "upload"], attach("*/*", false)],
+        ["PDF", "file-text", "Embed a PDF", ["pdf", "document"], attach("application/pdf,.pdf", true)],
+        ["Video", "video", "Embed a video file", ["video", "movie", "mp4"], attach("video/*", true)],
+        ["Audio", "music", "Embed an audio file", ["audio", "sound", "voice", "mp3"], attach("audio/*", true)],
+        ["Bookmark", "bookmark", "Link to a web page", ["book", "bookmark", "web", "url"], ({ editor, from, to }) => this.slashBookmark(editor, { from, to }, false)],
+        ["Embed", "monitor-play", "Embed a web page, video or image URL", ["embed", "iframe", "youtube"], ({ editor, from, to }) => this.slashBookmark(editor, { from, to }, true)],
+        ["Table", "table", "Simple Markdown table", ["table", "grid"], block("| Column 1 | Column 2 | Column 3 |\n| --- | --- | --- |\n| ", " |  |  |\n|  |  |  |", "")],
+        ["Code", "code-2", "Code block", ["code", "snippet", "```"], block("```", "\n\n```", "")],
+        ["Callout", "message-square", "Highlighted note, tip or warning", ["callout", "admonition", "note", "warning", "tip", "info"], ({ editor, from, to }) => this.slashCallout(editor, { from, to })],
+        ["Equation", "sigma", "Math block (LaTeX)", ["equation", "math", "latex", "formula", "$$"], block("$$\n", "\n$$", "")],
+      ]],
+      ["Project", [
+        ["Kanban board", "kanban-square", "Create a new board", ["kanban", "board", "kan", "base"], ({ editor, from, to }) => this.slashKanban(editor, { from, to })],
+      ]],
+      ["Structure", [
+        ["Table of contents", "list-tree", "Open the live outline of this page", ["toc", "contents", "outline"], ({ editor, from, to }) => { this.removeRange(editor, from, to); this.app.commands?.executeCommandById("outline:open"); }],
+        ["Breadcrumb", "map-pin", "Show where this page lives", ["bread", "breadcrumb", "breadcrumbs", "location", "path"], ({ editor, from, to, file }) => this.slashBreadcrumb(editor, { from, to }, file)],
+      ]],
+      ["Utility", [
+        ["Date", "calendar", "Today's date", ["date", "today"], ({ editor, from, to }) => this.replaceAndPlace(editor, from, to, window.moment().format("YYYY-MM-DD"))],
+        ["Time", "clock", "Current time", ["time", "now", "clock"], ({ editor, from, to }) => this.replaceAndPlace(editor, from, to, window.moment().format("HH:mm"))],
+        ["Emoji", "smile", "Insert an emoji", ["emoji", "emoticon", "smiley"], ({ editor, from, to }) => this.slashEmoji(editor, { from, to })],
+        ["Duplicate", "copy", "Duplicate this block", ["duplicate", "dup", "copy"], ({ editor, from, to }) => { this.removeRange(editor, from, to); this.duplicateBlock(editor); }],
+        ["Move to", "corner-down-right", "Move this block under a heading", ["moveto", "move", "mv"], ({ editor, from, to }) => { this.removeRange(editor, from, to); this.moveBlockToHeading(editor); }],
+        ["Delete", "trash-2", "Delete this block", ["delete", "del", "remove"], ({ editor, from, to }) => { this.removeRange(editor, from, to); this.deleteBlock(editor); }],
+      ]],
+    ];
+    const items = [];
+    for (const [group, entries] of groups) {
+      entries.forEach(([title, icon, description, aliases, run], i) => items.push({ group, firstInGroup: i === 0, title, icon, description, aliases, run }));
+    }
+    this._slashCommands = items;
+    return items;
+  }
+
+  removeRange(editor, from, to) {
+    editor.transaction({ changes: [{ from, to, text: "" }], selection: { from } });
+  }
+
+  replaceAndPlace(editor, from, to, text) {
+    editor.transaction({ changes: [{ from, to, text }], selection: { from: { line: from.line, ch: from.ch + text.length } } });
+  }
+
+  // Turn the current line into a kind of block, removing the typed "/query"
+  // in the same transaction (one undo step).
+  setLineKind(editor, { from, to }, kind) {
+    const lineNo = from.line;
+    const original = editor.getLine(lineNo);
+    let text = original.slice(0, from.ch) + original.slice(to.ch);
+    let caretInText = from.ch;
+    // "Hello /h1" -> "# Hello" (drop the space that preceded the command).
+    if (to.ch === original.length && / $/.test(original.slice(0, from.ch)) && text.trim()) {
+      text = text.replace(/ +$/, "");
+      caretInText = text.length;
+    }
+    const match = text.match(RIKKA_PREFIX_RE);
+    const indent = match[1] || "";
+    const oldPrefixLength = match[0].length;
+    const content = text.slice(oldPrefixLength);
+    const prefix = {
+      text: indent,
+      h1: "# ", h2: "## ", h3: "### ",
+      bullet: `${indent}- `,
+      numbered: `${indent}1. `,
+      todo: `${indent}- [ ] `,
+      quote: `${indent}> `,
+    }[kind] ?? indent;
+    const next = prefix + content;
+    const ch = Math.max(prefix.length, Math.min(next.length, prefix.length + (caretInText - oldPrefixLength)));
+    editor.transaction({
+      changes: [{ from: { line: lineNo, ch: 0 }, to: { line: lineNo, ch: original.length }, text: next }],
+      selection: { from: { line: lineNo, ch } },
+    });
+  }
+
+  // Insert a multi-line block. If the line is otherwise empty the block takes
+  // its place; otherwise it goes on the lines below. Caret lands at `middle`.
+  insertBlock(editor, { from, to }, open, close, middle) {
+    const lineNo = from.line;
+    const original = editor.getLine(lineNo);
+    const rest = (original.slice(0, from.ch) + original.slice(to.ch));
+    const emptyLine = rest.trim() === "";
+    const lead = emptyLine ? "" : `${rest}\n`;
+    const textBefore = lead + open;
+    const full = textBefore + middle + close;
+    const caretLines = textBefore.split("\n");
+    const caretLine = lineNo + caretLines.length - 1;
+    const caretCh = caretLines[caretLines.length - 1].length;
+    editor.transaction({
+      changes: [{ from: { line: lineNo, ch: 0 }, to: { line: lineNo, ch: original.length }, text: full }],
+      selection: middle
+        ? { from: { line: caretLine, ch: caretCh }, to: { line: caretLine, ch: caretCh + middle.length } }
+        : { from: { line: caretLine, ch: caretCh } },
+    });
+  }
+
+  insertDivider(editor, { from, to }) {
+    const lineNo = from.line;
+    const original = editor.getLine(lineNo);
+    const rest = original.slice(0, from.ch) + original.slice(to.ch);
+    // A blank line before "---" stops it turning the previous line into a heading.
+    const above = lineNo > 0 ? editor.getLine(lineNo - 1) : "";
+    const parts = [];
+    if (rest.trim()) parts.push(rest, "");
+    else if (above.trim()) parts.push("");
+    parts.push("---", "");
+    const text = parts.join("\n");
+    const lastLine = lineNo + parts.length - 1;
+    editor.transaction({
+      changes: [{ from: { line: lineNo, ch: 0 }, to: { line: lineNo, ch: original.length }, text }],
+      selection: { from: { line: lastLine, ch: 0 } },
+    });
+  }
+
+  toggleWrap(editor, open, close) {
+    const selection = editor.getSelection();
+    if (selection.startsWith(open) && selection.endsWith(close) && selection.length >= open.length + close.length) {
+      editor.replaceSelection(selection.slice(open.length, selection.length - close.length));
+      return;
+    }
+    const from = editor.getCursor("from");
+    editor.transaction({
+      changes: [{ from, to: editor.getCursor("to"), text: `${open}${selection}${close}` }],
+      selection: selection
+        ? { from: { line: from.line, ch: from.ch + open.length }, to: { line: from.line, ch: from.ch + open.length + selection.length } }
+        : { from: { line: from.line, ch: from.ch + open.length } },
+    });
+  }
+
+  shiftIndent(editor, direction) {
+    const from = editor.getCursor("from").line;
+    const to = editor.getCursor("to").line;
+    const unit = this.app.vault.getConfig?.("useTab") === false ? " ".repeat(this.app.vault.getConfig?.("tabSize") || 4) : "\t";
+    const changes = [];
+    for (let line = from; line <= to; line++) {
+      const text = editor.getLine(line);
+      if (direction > 0) changes.push({ from: { line, ch: 0 }, to: { line, ch: 0 }, text: unit });
+      else {
+        const lead = text.match(/^(\t| {1,4})/)?.[0];
+        if (lead) changes.push({ from: { line, ch: 0 }, to: { line, ch: lead.length }, text: "" });
+      }
+    }
+    if (changes.length) editor.transaction({ changes });
+  }
+
+  // A logical block in plain Markdown: a fenced code block, a list item with
+  // its nested children, a heading line, a table, or a paragraph/quote/callout
+  // (contiguous non-blank lines). Returns inclusive line numbers.
+  getBlockRange(editor, lineNo) {
+    const last = editor.lastLine();
+    const get = (i) => editor.getLine(i);
+    // Inside a fenced code block? The whole fence is the block.
+    let open = -1;
+    for (let i = 0; i <= last; i++) {
+      if (!/^\s*(```|~~~)/.test(get(i))) continue;
+      if (open < 0) { open = i; if (i > lineNo) break; }
+      else { if (lineNo >= open && lineNo <= i) return { start: open, end: i }; open = -1; if (i > lineNo) break; }
+    }
+    const text = get(lineNo);
+    if (!text.trim()) return { start: lineNo, end: lineNo };
+    if (/^#{1,6}\s/.test(text)) return { start: lineNo, end: lineNo };
+    const listItem = text.match(/^(\s*)([-*+]|\d+[.)])\s/);
+    if (listItem) {
+      const indent = listItem[1].replace(/\t/g, "    ").length;
+      let end = lineNo;
+      for (let i = lineNo + 1; i <= last; i++) {
+        const t = get(i);
+        if (!t.trim()) break;
+        const ind = t.match(/^\s*/)[0].replace(/\t/g, "    ").length;
+        if (ind > indent) end = i; else break;
+      }
+      return { start: lineNo, end };
+    }
+    let start = lineNo;
+    let end = lineNo;
+    const sameKind = (t) => t.trim() && !/^#{1,6}\s/.test(t) && !/^\s*([-*+]|\d+[.)])\s/.test(t) && !/^\s*(```|~~~)/.test(t);
+    while (start > 0 && sameKind(get(start - 1))) start--;
+    while (end < last && sameKind(get(end + 1))) end++;
+    return { start, end };
+  }
+
+  blockText(editor, { start, end }) {
+    const lines = [];
+    for (let i = start; i <= end; i++) lines.push(editor.getLine(i));
+    return lines.join("\n");
+  }
+
+  duplicateBlock(editor) {
+    const selection = editor.getSelection();
+    if (selection) {
+      const to = editor.getCursor("to");
+      editor.transaction({ changes: [{ from: to, to, text: selection }] });
+      return;
+    }
+    const range = this.getBlockRange(editor, editor.getCursor().line);
+    const text = this.blockText(editor, range);
+    const endCh = editor.getLine(range.end).length;
+    editor.transaction({
+      changes: [{ from: { line: range.end, ch: endCh }, to: { line: range.end, ch: endCh }, text: `\n${text}` }],
+      selection: { from: { line: range.end + 1 + (editor.getCursor().line - range.start), ch: editor.getCursor().ch } },
+    });
+  }
+
+  deleteBlock(editor) {
+    if (editor.getSelection()) { editor.replaceSelection(""); return; }
+    const range = this.getBlockRange(editor, editor.getCursor().line);
+    const last = editor.lastLine();
+    // Never empty the whole document by accident: one block at a time.
+    const from = range.end < last ? { line: range.start, ch: 0 } : range.start > 0 ? { line: range.start - 1, ch: editor.getLine(range.start - 1).length } : { line: range.start, ch: 0 };
+    const to = range.end < last ? { line: range.end + 1, ch: 0 } : { line: range.end, ch: editor.getLine(range.end).length };
+    editor.transaction({ changes: [{ from, to, text: "" }], selection: { from: { line: Math.min(range.start, Math.max(0, editor.lastLine() - (range.end - range.start + 1))), ch: 0 } } });
+  }
+
+  // Swap the current block with the next/previous block, skipping blank
+  // lines and keeping the spacing between them exactly as it was.
+  moveBlock(editor, direction) {
+    const cursor = editor.getCursor();
+    const range = this.getBlockRange(editor, cursor.line);
+    const last = editor.lastLine();
+    let probe = direction < 0 ? range.start - 1 : range.end + 1;
+    while (probe >= 0 && probe <= last && !editor.getLine(probe).trim()) probe += direction;
+    if (probe < 0 || probe > last) return;
+    const neighbour = this.getBlockRange(editor, probe);
+    const first = direction < 0 ? neighbour : range;
+    const second = direction < 0 ? range : neighbour;
+    const sep = [];
+    for (let i = first.end + 1; i < second.start; i++) sep.push(editor.getLine(i));
+    const joined = [this.blockText(editor, second), ...sep, this.blockText(editor, first)].join("\n");
+    const offset = cursor.line - range.start;
+    const secondLen = second.end - second.start + 1;
+    const newStart = direction < 0 ? first.start : first.start + secondLen + sep.length;
+    editor.transaction({
+      changes: [{ from: { line: first.start, ch: 0 }, to: { line: second.end, ch: editor.getLine(second.end).length }, text: joined }],
+      selection: { from: { line: newStart + offset, ch: cursor.ch } },
+    });
+  }
+
+  moveBlockToHeading(editor) {
+    const cursor = editor.getCursor();
+    const range = this.getBlockRange(editor, cursor.line);
+    const headings = [];
+    for (let i = 0; i <= editor.lastLine(); i++) {
+      const m = editor.getLine(i).match(/^(#{1,6})\s+(.*)$/);
+      if (m && (i < range.start || i > range.end)) headings.push({ line: i, level: m[1].length, title: m[2] });
+    }
+    if (!headings.length) { new Notice("Add a heading first, then move blocks under it."); return; }
+    const choices = headings.map((h) => ({ value: h, label: `${"  ".repeat(h.level - 1)}${h.title}` }));
+    new RikkaChoiceModal(this.app, "Move block under heading…", choices, (heading) => {
+      // End of that heading's section: next heading of same or higher level.
+      let target = editor.lastLine();
+      for (let i = heading.line + 1; i <= editor.lastLine(); i++) {
+        const m = editor.getLine(i).match(/^(#{1,6})\s/);
+        if (m && m[1].length <= heading.level) { target = i - 1; break; }
+      }
+      while (target > heading.line && !editor.getLine(target).trim()) target--;
+      const text = this.blockText(editor, range);
+      const removeFrom = { line: range.start, ch: 0 };
+      const removeTo = range.end < editor.lastLine() ? { line: range.end + 1, ch: 0 } : { line: range.end, ch: editor.getLine(range.end).length };
+      const insertAt = { line: target, ch: editor.getLine(target).length };
+      // Both edits in one transaction (one undo step); CodeMirror maps positions.
+      editor.transaction({ changes: [{ from: removeFrom, to: removeTo, text: "" }, { from: insertAt, to: insertAt, text: `\n${text}` }] });
+    }).open();
+  }
+
+  async slashCallout(editor, { from, to }) {
+    const types = [["note", "Note"], ["info", "Info"], ["tip", "Tip"], ["important", "Important"], ["warning", "Warning"], ["question", "Question"]];
+    new RikkaChoiceModal(this.app, "Callout type", types.map(([value, label]) => ({ value, label })), (type) => {
+      this.insertBlock(editor, { from, to }, `> [!${type}]\n> `, "", "");
+      editor.focus();
+    }).open();
+  }
+
+  async slashEmoji(editor, { from, to }) {
+    const list = "😀 smile|😂 laugh|🙂 slight smile|😉 wink|😍 love|🤔 think|😅 sweat|😎 cool|🙏 pray thanks|👍 thumbs up yes|👎 thumbs down no|👏 clap|🙌 celebrate|💪 strong|👀 eyes look|🎉 party tada|🔥 fire hot|✨ sparkles|⭐ star|💡 idea bulb|✅ done check|❌ cross no|⚠️ warning|❗ important|❓ question|📌 pin|📎 paperclip|📝 note memo|📚 books|📖 book read|🗂️ folders|📁 folder|📅 calendar date|⏰ alarm time|🚀 rocket launch|🎯 target goal|💬 comment|📣 announce|🔗 link|🔒 lock|🔑 key|💰 money|📈 chart up growth|📉 chart down|🧠 brain|❤️ heart|💜 purple heart|🌱 seedling grow|☕ coffee|🏁 finish flag|🛠️ tools build|🐛 bug|🎨 art design|🧪 test experiment|🗓️ schedule"
+      .split("|").map((entry) => { const [emoji, ...words] = entry.split(" "); return { value: emoji, label: `${emoji}  ${words.join(" ")}` }; });
+    new RikkaChoiceModal(this.app, "Search emoji", list, (emoji) => {
+      this.replaceAndPlace(editor, from, to, emoji);
+      editor.focus();
+    }).open();
+  }
+
+  async slashBookmark(editor, { from, to }, embed) {
+    new RikkaNameModal(this.app, embed ? "Embed a URL" : "Bookmark a web page", "https://…", (url) => {
+      const clean = url.trim();
+      if (!/^(https?:\/\/)[^\s]+$/i.test(clean)) { new Notice("Enter a full URL starting with https://"); return false; }
+      let label = clean;
+      try { label = new URL(clean).hostname.replace(/^www\./, ""); } catch (error) { /* keep raw */ }
+      const text = embed ? `![](${clean})` : `[${label}](${clean})`;
+      this.replaceAndPlace(editor, from, to, text);
+      window.setTimeout(() => editor.focus(), 0);
+    }, { buttonText: embed ? "Embed" : "Add", inputType: "url" }).open();
+  }
+
+  slashBreadcrumb(editor, { from, to }, file) {
+    this.removeRange(editor, from, to);
+    if (!(file instanceof TFile)) return;
+    const parts = file.path.replace(/\.md$/i, "").split("/");
+    new Notice(parts.join(" / "), 4000);
+    // Show it in the Binder too (dynamic, nothing stale written into the note).
+    const view = this.getView();
+    if (view) { view.setSelected(file.path); this.setContextFromItem(file, "draft"); }
+  }
+
+  async slashNewPage(editor, { from, to }, file) {
+    // New page goes next to the page being edited.
+    const parent = file?.parent?.path && file.parent.path !== "/" ? file.parent.path : "";
+    const where = parent ? parent.split("/").pop() : "vault root";
+    new RikkaNameModal(this.app, `New page in ${where}`, "Page title", async (name) => {
+      const safe = this.safeName(name);
+      if (!safe) return false;
+      const path = this.availablePath(parent, safe, "md");
+      if (path !== `${parent ? `${parent}/` : ""}${safe}.md`) return path.split("/").pop().replace(/\.md$/, "");
+      const created = await this.app.vault.create(path, "");
+      const link = this.app.fileManager.generateMarkdownLink(created, file?.path || "");
+      this.replaceAndPlace(editor, from, to, link);
+      new Notice(`Created “${created.basename}”. Tap the link to open it.`);
+      window.setTimeout(() => editor.focus(), 0);
+    }, { subtitle: parent || "/", draftKey: `page:${parent}` }).open();
+  }
+
+  slashKanban(editor, { from, to }) {
+    this.removeRange(editor, from, to);
+    const id = Object.keys(this.app.commands?.commands || {}).find((key) => key.endsWith(":create-board") && key.includes("board"));
+    if (id) this.app.commands.executeCommandById(id);
+    else new Notice("Install or enable the Base Board plugin to create boards.");
+  }
+
+  // Attachments go through Obsidian's own attachment settings and never
+  // overwrite an existing file (getAvailablePathForAttachment adds " 1", " 2"…).
+  pickAttachment(editor, { from, to }, file, accept, embed) {
+    this.removeRange(editor, from, to);
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = accept;
+    input.style.display = "none";
+    document.body.appendChild(input);
+    const cleanup = () => input.remove();
+    input.addEventListener("change", async () => {
+      const chosen = input.files?.[0];
+      cleanup();
+      if (!chosen) return;
+      try {
+        const sourcePath = file?.path || "";
+        const target = await this.app.fileManager.getAvailablePathForAttachment(chosen.name, sourcePath);
+        const created = await this.app.vault.createBinary(target, await chosen.arrayBuffer());
+        const link = this.app.fileManager.generateMarkdownLink(created, sourcePath);
+        const text = embed && !link.startsWith("!") ? `!${link}` : link;
+        const at = editor.getCursor();
+        editor.transaction({ changes: [{ from: at, to: at, text }], selection: { from: { line: at.line, ch: at.ch + text.length } } });
+        editor.focus();
+      } catch (error) {
+        console.error("Rikka attachment failed", error);
+        new Notice(`Couldn't add that file: ${error?.message || error}`);
+      }
+    }, { once: true });
+    input.click();
+  }
+
+  availablePath(folder, base, extension) {
+    const prefix = folder ? `${folder}/` : "";
+    let path = `${prefix}${base}.${extension}`;
+    for (let n = 2; this.app.vault.getAbstractFileByPath(path); n++) path = `${prefix}${base} ${n}.${extension}`;
+    return path;
   }
 
   // ---- Current location ("context") -------------------------------------
@@ -1644,8 +2331,7 @@ module.exports = class RikkaPlugin extends Plugin {
       if (!safe) return;
       const path = `${info.targetPath}/${safe}.md`;
       if (this.app.vault.getAbstractFileByPath(path)) {
-        new Notice(`“${safe}” already exists in ${info.name}.`);
-        return false;
+        return this.availablePath(info.targetPath, safe, "md").split("/").pop().replace(/\.md$/, "");
       }
       const file = await this.app.vault.create(path, "");
       await this.registerInSection(info, file.path);
@@ -1670,8 +2356,9 @@ module.exports = class RikkaPlugin extends Plugin {
       if (!safe) return;
       const path = `${info.targetPath}/${safe}`;
       if (this.app.vault.getAbstractFileByPath(path)) {
-        new Notice(`“${safe}” already exists in ${info.name}.`);
-        return false;
+        let n = 2;
+        while (this.app.vault.getAbstractFileByPath(`${info.targetPath}/${safe} ${n}`)) n++;
+        return `${safe} ${n}`;
       }
       await this.app.vault.createFolder(path);
       await this.registerInSection(info, path);
@@ -1746,8 +2433,25 @@ module.exports = class RikkaPlugin extends Plugin {
     }, "Move")).open();
   }
 
+  // Natural titles in, filesystem-safe names out: reserved characters become
+  // "—", whitespace is collapsed, leading dots (hidden files) and trailing
+  // dots/spaces are dropped, and very long names are trimmed.
   safeName(value) {
-    return value.replace(/[\\/:*?"<>|]/g, "—").replace(/[. ]+$/g, "").trim();
+    let name = String(value)
+      .replace(/[\u0000-\u001f]/g, "")
+      .replace(/\s*[\\/]\s*/g, " - ")      // a/b   -> a - b
+      .replace(/\s*:\s*/g, " - ")            // Q: x  -> Q - x
+      .replace(/"/g, "'")
+      .replace(/[*?<>|#^\[\]]/g, "")
+      .replace(/(\s-)+\s*$/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^\.+/, "")
+      .replace(/[. ]+$/g, "")
+      .replace(/^-\s+|\s+-$/g, "")
+      .trim();
+    if (name.length > 180) name = name.slice(0, 180).trim();
+    return name === "." || name === ".." ? "" : name;
   }
 
   async moveToCollection(path, collection) {
