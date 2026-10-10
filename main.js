@@ -1,4 +1,4 @@
-const { ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon } = require("obsidian");
+const { ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon, parseYaml, stringifyYaml } = require("obsidian");
 
 const VIEW_TYPE = "rikka-binder";
 const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [], wordTarget: 0 };
@@ -428,6 +428,7 @@ module.exports = class RikkaPlugin extends Plugin {
       this.refreshTimer = window.setTimeout(() => this.refreshViews(), 800);
     }));
 
+    this.installBoardCreationSupport();
     this.installMobileBoardSupport();
 
     this.app.workspace.onLayoutReady(() => this.runSafely(() => this.activateView(), "Open Rikka Binder"));
@@ -441,13 +442,114 @@ module.exports = class RikkaPlugin extends Plugin {
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
+  installBoardCreationSupport() {
+    const enhance = () => {
+      document.querySelectorAll(".base-board-column").forEach((column) => {
+        if (column.querySelector(".base-board-column-add-card-footer")) return;
+        const footer = column.createDiv({ cls: "base-board-column-add-card-footer" });
+        footer.createEl("button", {
+          cls: "base-board-column-add-card-footer-button",
+          text: "+ Add new item",
+          attr: { type: "button", "aria-label": `Add new item to ${column.dataset.columnName || "column"}` }
+        });
+      });
+    };
+    this.registerDomEvent(document, "click", (event) => {
+      const button = event.target?.closest?.(".base-board-column-add-card, .base-board-column-add-card-footer-button");
+      if (!button) return;
+      const column = button.closest(".base-board-column");
+      if (!column) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      this.startBoardCardInput(column);
+    }, true);
+    const observer = new MutationObserver(enhance);
+    observer.observe(this.app.workspace.containerEl, { childList: true, subtree: true });
+    this.register(() => observer.disconnect());
+    enhance();
+  }
+
+  startBoardCardInput(column) {
+    const existing = column.querySelector(".rikka-board-card-input");
+    if (existing) { existing.focus(); return; }
+    const cards = column.querySelector(".base-board-cards");
+    if (!cards) return;
+    const wrapper = cards.createDiv({ cls: "base-board-add-card-input-wrapper rikka-board-input-wrapper" });
+    const input = wrapper.createEl("input", {
+      cls: "base-board-add-card-input rikka-board-card-input",
+      attr: { type: "text", placeholder: "New item", "aria-label": "New card title", inputmode: "text", autocapitalize: "sentences", autocomplete: "off" }
+    });
+    let busy = false;
+    const commit = async () => {
+      if (busy || !input.value.trim()) return;
+      busy = true;
+      input.disabled = true;
+      try {
+        await this.createBoardCard(column, input.value.trim());
+        wrapper.remove();
+      } catch (error) {
+        busy = false;
+        input.disabled = false;
+        new Notice(`Could not add item: ${error?.message || error}`);
+        input.focus();
+      }
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        this.mobileDragClickSuppression = Date.now() + 1200;
+        void commit();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        wrapper.remove();
+      }
+    });
+    input.focus({ preventScroll: true });
+    wrapper.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  async createBoardCard(column, title) {
+    let boardLeaf;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view?.containerEl?.contains(column)) boardLeaf = leaf;
+    });
+    const statePath = boardLeaf?.view?.getState?.()?.file;
+    const baseFile = boardLeaf?.view?.file || (statePath && this.app.vault.getAbstractFileByPath(statePath));
+    if (!(baseFile instanceof TFile) || baseFile.extension !== "base") {
+      throw new Error("Open the board as a page before adding an item.");
+    }
+    const definition = parseYaml(await this.app.vault.read(baseFile)) || {};
+    const config = (definition.views || []).find((view) => view.type === "base-board");
+    const groupProperty = (config?.groupBy?.property || "status").replace(/^note\./, "");
+    const folder = config?.newItemFolder || baseFile.parent?.path || "";
+    const safeTitle = title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, " — ").replace(/\s+/g, " ").trim().slice(0, 160);
+    if (!safeTitle) throw new Error("Enter a title for the item.");
+    const orders = Array.from(column.querySelectorAll(".base-board-card[data-file-path]")).map((card) => {
+      const file = this.app.vault.getAbstractFileByPath(card.dataset.filePath);
+      return file && this.app.metadataCache.getFileCache(file)?.frontmatter?.kanban_order;
+    });
+    const keys = orders.filter((order) => typeof order === "string").sort();
+    const numbers = orders.filter((order) => typeof order === "number" && Number.isFinite(order));
+    const order = keys.length ? keys[keys.length - 1] + "V" : numbers.length ? Math.max(...numbers) + 1000 : 1000;
+    const properties = { ...(config?.newItemProperties || {}), [groupProperty]: column.dataset.columnName, kanban_order: order };
+    let path = `${folder ? folder + "/" : ""}${safeTitle}.md`;
+    for (let suffix = 2; this.app.vault.getAbstractFileByPath(path); suffix++) {
+      path = `${folder ? folder + "/" : ""}${safeTitle} ${suffix}.md`;
+    }
+    // Creating through the vault keeps Bases from opening the new note/properties.
+    // The board refreshes from the normal vault event while its tab stays active.
+    await this.app.vault.create(path, `---\n${stringifyYaml(properties)}---\n\n`);
+  }
+
   installMobileBoardSupport() {
     if (!Platform.isMobile) return;
     this.mobileDragClickSuppression = 0;
     this.mobileBoardCleanups = new Set();
     this.registerDomEvent(document, "keydown", (event) => {
       const input = event.target;
-      if (!(input instanceof HTMLInputElement) || !input.matches(".base-board-add-card-input")) return;
+      if (!(input instanceof HTMLInputElement) || !input.matches(".base-board-add-card-input") || input.matches(".rikka-board-card-input")) return;
       if (event.key !== "Enter") return;
       // Base Board commits on both Enter and blur. Handling Enter here keeps
       // the key from reaching Obsidian after Base Board removes its input;
