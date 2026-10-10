@@ -434,6 +434,18 @@
   .rikka-row-wordcount { font-size: 12px; }
   .rikka-section-count { font-size: 13px; }
   .rikka-empty { font-size: 14px; }
+
+  .base-board-add-card-input-wrapper { padding: 5px 8px 10px; }
+  .base-board-add-card-input {
+    box-sizing: border-box;
+    min-height: 46px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    font-size: 16px !important;
+    line-height: 22px;
+    -webkit-appearance: none;
+    appearance: none;
+  }
 }
 
 /* Rikka preference: keep note hover previews from covering the active board. */

@@ -437,12 +437,136 @@ module.exports = class RikkaPlugin extends Plugin {
       this.refreshTimer = window.setTimeout(() => this.refreshViews(), 800);
     }));
 
+    this.installMobileBoardSupport();
+
     this.app.workspace.onLayoutReady(() => this.runSafely(() => this.activateView(), "Open Rikka Binder"));
   }
 
   onunload() {
     window.clearTimeout(this.refreshTimer);
+    this.mobileBoardObserver?.disconnect();
+    for (const cleanup of this.mobileBoardCleanups || []) cleanup();
+    this.mobileBoardCleanups?.clear();
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+  }
+
+  installMobileBoardSupport() {
+    if (!Platform.isMobile) return;
+    this.mobileDragClickSuppression = 0;
+    this.mobileBoardCleanups = new Set();
+    this.registerDomEvent(document, "keydown", (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || !input.matches(".base-board-add-card-input")) return;
+      if (event.key === "Enter" || event.key === "Escape") {
+        // Let Base Board's own input handler commit/cancel first, then keep the
+        // key from reaching Obsidian's page-level shortcuts after it removes the input.
+        input.addEventListener("keydown", (keyEvent) => keyEvent.stopPropagation(), { once: true });
+      }
+    }, true);
+    this.registerDomEvent(document, "click", (event) => {
+      if (Date.now() >= this.mobileDragClickSuppression) return;
+      if (!event.target?.closest?.(".base-board-card")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+
+    const attachTouchDrag = () => {
+      for (const leaf of this.app.workspace.getLeavesOfType("base-board")) {
+        const manager = leaf.view?.dragDropManager;
+        const board = leaf.view?.containerEl?.querySelector(".base-board-board");
+        if (!manager || !board || manager.__rikkaTouchBoard === board) continue;
+        manager.__rikkaTouchCleanup?.();
+        let state = null;
+        let timer = 0;
+        const clearPending = () => {
+          window.clearTimeout(timer);
+          timer = 0;
+          if (!state?.active) state = null;
+        };
+        const onStart = (event) => {
+          if (event.touches.length !== 1 || !(event.target instanceof Element)) return;
+          const card = event.target.closest(".base-board-card");
+          if (!card || event.target.closest("button, input, a, textarea, select")) return;
+          const touch = event.touches[0];
+          state = { card, id: touch.identifier, x: touch.clientX, y: touch.clientY, lastX: touch.clientX, lastY: touch.clientY, active: false };
+          timer = window.setTimeout(() => {
+            if (!state || state.card !== card) return;
+            const rect = card.getBoundingClientRect();
+            manager.clearDropHighlight();
+            manager.dragType = "card";
+            manager.draggedEl = card;
+            manager.draggedCardHeight = rect.height;
+            manager.placeholderEl = board.createDiv();
+            manager.placeholderEl.className = "base-board-card-placeholder";
+            manager.placeholderEl.style.height = `${rect.height}px`;
+            card.parentElement?.insertBefore(manager.placeholderEl, card);
+            card.addClass("base-board-card--dragging");
+            board.addClass("base-board-board--is-dragging");
+            state.active = true;
+            if (navigator.vibrate) navigator.vibrate(10);
+          }, 280);
+        };
+        const onMove = (event) => {
+          if (!state) return;
+          const touch = Array.from(event.touches).find((item) => item.identifier === state.id);
+          if (!touch) return;
+          state.lastX = touch.clientX;
+          state.lastY = touch.clientY;
+          if (!state.active) {
+            if (Math.hypot(touch.clientX - state.x, touch.clientY - state.y) > 9) clearPending();
+            return;
+          }
+          event.preventDefault();
+          const target = document.elementFromPoint(touch.clientX, touch.clientY);
+          if (!target || !board.contains(target)) return;
+          manager.updateAutoScroll(touch.clientX, touch.clientY, target);
+          manager.handleCardDragOver({ target, clientX: touch.clientX, clientY: touch.clientY });
+        };
+        const onEnd = async (event) => {
+          if (!state) return;
+          window.clearTimeout(timer);
+          timer = 0;
+          const drag = state;
+          state = null;
+          if (!drag.active) return;
+          this.mobileDragClickSuppression = Date.now() + 700;
+          const touch = event.changedTouches && Array.from(event.changedTouches).find((item) => item.identifier === drag.id);
+          const x = touch?.clientX ?? drag.lastX;
+          const y = touch?.clientY ?? drag.lastY;
+          const target = document.elementFromPoint(x, y);
+          if (target && board.contains(target)) {
+            await manager.handleCardDrop({ target, preventDefault() {} });
+          }
+          if (manager.dragType) manager.onDragEnd();
+        };
+        const onCancel = () => {
+          window.clearTimeout(timer);
+          timer = 0;
+          state = null;
+          if (manager.dragType) manager.onDragEnd();
+        };
+        board.addEventListener("touchstart", onStart, { passive: true });
+        board.addEventListener("touchmove", onMove, { passive: false });
+        board.addEventListener("touchend", onEnd, { passive: true });
+        board.addEventListener("touchcancel", onCancel, { passive: true });
+        manager.__rikkaTouchBoard = board;
+        manager.__rikkaTouchCleanup = () => {
+          window.clearTimeout(timer);
+          board.removeEventListener("touchstart", onStart);
+          board.removeEventListener("touchmove", onMove);
+          board.removeEventListener("touchend", onEnd);
+          board.removeEventListener("touchcancel", onCancel);
+          manager.__rikkaTouchBoard = null;
+          this.mobileBoardCleanups.delete(manager.__rikkaTouchCleanup);
+        };
+        this.mobileBoardCleanups.add(manager.__rikkaTouchCleanup);
+      }
+    };
+    this.registerEvent(this.app.workspace.on("layout-change", attachTouchDrag));
+    this.mobileBoardObserver = new MutationObserver(attachTouchDrag);
+    this.mobileBoardObserver.observe(this.app.workspace.containerEl, { childList: true, subtree: true });
+    this.register(() => this.mobileBoardObserver?.disconnect());
+    attachTouchDrag();
   }
 
   async activateView() {
