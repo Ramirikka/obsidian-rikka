@@ -1,15 +1,15 @@
-name: Release
+name: Attach plugin files to release
 on:
-  push:
-    tags: ["*"]
+  release:
+    types: [published]
 permissions:
   contents: write
 jobs:
-  release:
+  upload:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Create release
+      - name: Upload main.js, manifest.json, styles.css
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release upload "${{ github.event.release.tag_name }}" main.js manifest.json styles.css --clobber
