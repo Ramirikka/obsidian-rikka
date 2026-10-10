@@ -1,7 +1,7 @@
 const { ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon, parseYaml, stringifyYaml } = require("obsidian");
 
 const VIEW_TYPE = "rikka-binder";
-const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [], wordTarget: 0 };
+const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [] };
 const RIKKA_PROJECTS = [
   { id: "itl", name: "ITL", path: "ITL/ITL Obsidian" },
   { id: "cfi", name: "CFI", path: "CFI" },
@@ -163,8 +163,8 @@ class RikkaBinderView extends ItemView {
     this.makeToolbarButton(actions, "folder-plus", "New folder", () => this.plugin.promptNewFolder());
     this.makeToolbarButton(actions, "library", "New collection", () => this.plugin.promptNewCollection());
 
-    const target = root.createDiv({ cls: "rikka-target" });
-    void this.plugin.renderWordTarget(target);
+    const wordCount = root.createDiv({ cls: "rikka-target" });
+    void this.plugin.renderDraftWordCount(wordCount);
 
     const scroll = root.createDiv({ cls: "rikka-scroll" });
     const draftItems = this.plugin.getDraftItems();
@@ -305,8 +305,17 @@ class RikkaBinderView extends ItemView {
     row.dataset.path = item.path;
     row.draggable = true;
     row.addEventListener("dragstart", (event) => {
+      // Register the drag with Obsidian's own drag manager so the item can also
+      // be dropped on the core File explorer / editor like a native file drag.
+      try {
+        const manager = this.plugin.app.dragManager;
+        const data = isFile ? manager?.dragFile?.(event, item) : manager?.dragFolder?.(event, item);
+        if (data) manager.onDragStart(event, data);
+      } catch (error) {
+        console.debug("Rikka: native drag hand-off unavailable", error);
+      }
       event.dataTransfer?.setData("text/plain", item.path);
-      if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = "all";
     });
     row.addEventListener("contextmenu", (event) => {
       event.preventDefault();
@@ -432,7 +441,8 @@ module.exports = class RikkaPlugin extends Plugin {
     this.data.trash = this.asPathList(this.data.trash);
     this.data.templates = this.asPathList(this.data.templates);
     this.data.collections = this.asCollections(this.data.collections);
-    this.data.wordTarget = Number.isFinite(Number(this.data.wordTarget)) && Number(this.data.wordTarget) > 0 ? Number(this.data.wordTarget) : 0;
+    delete this.data.wordTarget;
+    for (const state of Object.values(this.data.projectStates || {})) if (state && typeof state === "object") delete state.wordTarget;
     this.wordCountCache = new Map();
     this.stateSaveQueue = Promise.resolve();
 
@@ -580,59 +590,84 @@ module.exports = class RikkaPlugin extends Plugin {
     await this.app.vault.create(path, `---\n${stringifyYaml(properties).trimEnd()}\n---\n\n`);
   }
 
-  // When a card is added on a board, keep the board on screen: if anything tries
-  // to open the newly created note (or its properties) right after creation,
-  // close that and return to the board. Tapping a card later still opens it.
+  // ---- Board cards: create != open, and native back navigation ----
+  //
+  // Base Board creates cards through Obsidian's BasesView.createFileForView(),
+  // which creates the note AND opens it. Its default "modal" open behaviour
+  // shows the note in a CardDetailModal built on a detached leaf, which is
+  // outside navigation history, so the back button can't dismiss it.
+  //
+  // 1. While a card is being created, WorkspaceLeaf.openFile() is blocked for
+  //    the newly created note, so creating a card never opens anything.
+  // 2. On mobile, tapping a card opens the note in the board's own tab
+  //    (getLeaf(false)), so Obsidian's normal back button returns to the board.
   armNewCardGuard() {
-    this.newCardGuardUntil = Date.now() + 2500;
-    this.newCardBoardLeaf = this.app.workspace.getMostRecentLeaf?.() || null;
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      if (leaf.view?.getViewType?.() === "base-board" || leaf.view?.file?.extension === "base") {
-        if (leaf === this.app.workspace.activeLeaf || !this.newCardBoardLeaf) this.newCardBoardLeaf = leaf;
-      }
-    });
+    this.newCardGuardUntil = Date.now() + 3000;
+  }
+
+  isGuardedNewCard(file) {
+    return file instanceof TFile && Date.now() < this.newCardGuardUntil && this.newCardPaths.has(file.path);
   }
 
   installNewCardOpenGuard() {
+    const { WorkspaceLeaf } = require("obsidian");
     this.newCardPaths = new Set();
     this.newCardGuardUntil = 0;
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (Date.now() < this.newCardGuardUntil && file instanceof TFile && file.extension === "md") {
-        this.newCardPaths.add(file.path);
-        window.setTimeout(() => this.newCardPaths.delete(file.path), 2500);
-      }
+      if (Date.now() >= this.newCardGuardUntil || !(file instanceof TFile) || file.extension !== "md") return;
+      this.newCardPaths.add(file.path);
+      window.setTimeout(() => this.newCardPaths.delete(file.path), 3000);
     }));
-    const restoreBoard = (leaf) => {
-      const board = this.newCardBoardLeaf;
-      if (!leaf || leaf === board) {
-        // The board's own tab navigated to the note: go back to the board.
-        leaf?.history?.back?.();
-        return;
+
+    // Block opening a just-created card (covers getLeaf().openFile and openLinkText).
+    const plugin = this;
+    const original = WorkspaceLeaf.prototype.openFile;
+    WorkspaceLeaf.prototype.openFile = function (file, ...rest) {
+      if (plugin.isGuardedNewCard(file)) {
+        plugin.newCardPaths.delete(file.path);
+        // A brand-new empty tab/split created only to show the card: remove it.
+        if (this.view?.getViewType?.() === "empty") window.setTimeout(() => this.detach(), 0);
+        return Promise.resolve();
       }
-      leaf.detach();
-      if (board) this.app.workspace.setActiveLeaf(board, { focus: false });
+      return original.call(this, file, ...rest);
     };
-    this.registerEvent(this.app.workspace.on("file-open", (file) => {
-      if (!file || !this.newCardPaths.has(file.path)) return;
-      this.newCardPaths.delete(file.path);
-      const leaf = this.app.workspace.getMostRecentLeaf?.() || this.app.workspace.activeLeaf;
-      window.setTimeout(() => restoreBoard(leaf), 50);
-    }));
-    // Some boards open the new card in a popover/modal instead of a tab.
-    const observer = new MutationObserver(() => {
-      if (Date.now() >= this.newCardGuardUntil || !this.newCardPaths.size) return;
-      document.querySelectorAll(".modal-container, .popover.hover-popover").forEach((el) => {
-        const text = el.getAttribute("data-path") || el.querySelector("[data-path]")?.getAttribute("data-path") || "";
-        const title = el.querySelector(".inline-title, .view-header-title, .modal-title")?.textContent?.trim() || "";
-        const match = [...this.newCardPaths].some((path) => path === text || path.endsWith(`/${title}.md`));
-        if (!match) return;
-        const close = el.querySelector(".modal-close-button");
-        if (close) close.click(); else el.remove();
-      });
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
-    this.register(() => observer.disconnect());
+    this.register(() => { WorkspaceLeaf.prototype.openFile = original; });
+
+    // Arm the guard whenever Base Board's own add-card input commits (Enter or blur).
+    this.registerDomEvent(document, "keydown", (event) => {
+      if (event.key === "Enter" && event.target?.matches?.(".base-board-add-card-input")) this.armNewCardGuard();
+    }, true);
+    this.registerDomEvent(document, "focusout", (event) => {
+      const input = event.target;
+      if (input?.matches?.(".base-board-add-card-input") && input.value?.trim()) this.armNewCardGuard();
+    }, true);
+
+    // An intentional tap/click on a card always opens it, even right after creation.
+    this.registerDomEvent(document, "pointerdown", (event) => {
+      const card = event.target?.closest?.(".base-board-card[data-file-path]");
+      if (card) this.newCardPaths.delete(card.dataset.filePath);
+    }, true);
+
+    // Mobile: open cards in the board's tab so the native back button works.
+    if (Platform.isMobile) {
+      this.registerDomEvent(document, "click", (event) => {
+        if (Date.now() < (this.mobileDragClickSuppression || 0)) return;
+        const target = event.target;
+        const card = target?.closest?.(".base-board-card[data-file-path]");
+        if (!card || target.closest("button, input, textarea, select, a, .base-board-card-edit")) return;
+        const file = this.app.vault.getAbstractFileByPath(card.dataset.filePath);
+        if (!(file instanceof TFile)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        let leaf = null;
+        this.app.workspace.iterateAllLeaves((candidate) => {
+          if (!leaf && candidate.view?.containerEl?.contains(card)) leaf = candidate;
+        });
+        (leaf || this.app.workspace.getLeaf(false)).openFile(file, { active: true });
+      }, true);
+    }
   }
+
 
   installMobileBoardSupport() {
     if (!Platform.isMobile) return;
@@ -808,7 +843,6 @@ module.exports = class RikkaPlugin extends Plugin {
     state.trash = this.asPathList(state.trash);
     state.templates = this.asPathList(state.templates);
     state.collections = this.asCollections(state.collections);
-    state.wordTarget = Number.isFinite(Number(state.wordTarget)) && Number(state.wordTarget) > 0 ? Number(state.wordTarget) : 0;
     for (const key of Object.keys(DEFAULT_DATA)) this.data[key] = state[key];
   }
 
@@ -844,7 +878,7 @@ module.exports = class RikkaPlugin extends Plugin {
       const project = { id, name: folderName, path };
       this.projects.push(project);
       this.data.projects = this.projects;
-      this.data.projectStates[id] = Object.assign({}, DEFAULT_DATA, { collapsed: {}, research: [], trash: [], collections: {}, templates: [], wordTarget: 0 });
+      this.data.projectStates[id] = Object.assign({}, DEFAULT_DATA, { collapsed: {}, research: [], trash: [], collections: {}, templates: [] });
       await this.selectProject(id);
       new Notice(`${folderName} is ready in LIFE2.0.`);
     }).open();
@@ -1129,7 +1163,7 @@ module.exports = class RikkaPlugin extends Plugin {
     return String(text).replace(/^\uFEFF/, "").replace(/^---[ \t]*\r?\n[\s\S]*?^---[ \t]*(?:\r?\n|$)/m, "");
   }
 
-  async renderWordTarget(container) {
+  async renderDraftWordCount(container) {
     container.empty();
     const words = await this.getDraftWordCount();
     const binder = container.closest(".rikka-binder");
