@@ -1749,6 +1749,8 @@ module.exports = class RikkaPlugin extends Plugin {
     const check = () => void this.checkForSelfUpdate(false);
     this.app.workspace.onLayoutReady(() => window.setTimeout(check, 4000));
     this.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") check(); });
+    // Desktop: switching back to the Obsidian window doesn't change visibility.
+    this.registerDomEvent(window, "focus", check);
     this.registerInterval(window.setInterval(check, 30 * 60 * 1000));
   }
 
