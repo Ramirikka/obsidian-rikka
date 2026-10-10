@@ -1,4 +1,4 @@
-const { EditorSuggest, FuzzySuggestModal, ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon, parseYaml, stringifyYaml } = require("obsidian");
+const { EditorSuggest, FuzzySuggestModal, ItemView, Menu, Modal, Notice, Platform, Plugin, PluginSettingTab, Setting, TFile, TFolder, setIcon, parseYaml, stringifyYaml } = require("obsidian");
 
 const VIEW_TYPE = "rikka-binder";
 const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [], context: { section: "draft", folder: "" } };
@@ -196,9 +196,6 @@ class RikkaBinderView extends ItemView {
     this.makeToolbarButton(actions, "file-plus-2", "New document here", () => this.plugin.promptNewNote());
     this.makeToolbarButton(actions, "folder-plus", "New folder here", () => this.plugin.promptNewFolder());
     this.makeToolbarButton(actions, "more-horizontal", "More", (event) => this.plugin.showToolbarMore(event));
-
-    this.updateSlot = root.createDiv({ cls: "rikka-update-slot" });
-    this.renderUpdateButton();
 
     // Location bar: where new things will go, plus the draft word count.
     const location = root.createDiv({ cls: "rikka-target rikka-location" });
@@ -693,6 +690,31 @@ class RikkaMentionSuggest extends EditorSuggest {
       ? item.date.format("YYYY-MM-DD")
       : this.app.fileManager.generateMarkdownLink(item.file, file?.path || "");
     editor.transaction({ changes: [{ from: start, to: end, text }], selection: { from: { line: start.line, ch: start.ch + text.length } } });
+  }
+}
+
+class RikkaSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  async display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    const version = await this.plugin.installedVersion();
+    new Setting(containerEl)
+      .setName("Update Rikka")
+      .setDesc(`Installed version: ${version}. Checks GitHub for a newer release and installs it.`)
+      .addButton((button) => button
+        .setButtonText("Update Rikka")
+        .setCta()
+        .onClick(async () => {
+          button.setDisabled(true).setButtonText("Checking…");
+          await this.plugin.installUpdate(true);
+          button.setDisabled(false).setButtonText("Update Rikka");
+          window.setTimeout(() => this.display(), 1500);
+        }));
   }
 }
 
@@ -1763,12 +1785,11 @@ module.exports = class RikkaPlugin extends Plugin {
   // most every 30 minutes). If a newer release exists, an "Update Rikka"
   // button appears in the Binder. Nothing is installed until it is tapped.
   installUpdateChecker() {
+    // No background checks: updating only happens from the button in
+    // Settings → Rikka (or the "Update Rikka" command).
     this.availableUpdate = null;
     this.addCommand({ id: "update-rikka", name: "Update Rikka", icon: "download", callback: () => this.installUpdate(true) });
-    const quietCheck = () => void this.findUpdate();
-    this.app.workspace.onLayoutReady(() => window.setTimeout(quietCheck, 5000));
-    this.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") quietCheck(); });
-    this.registerInterval(window.setInterval(quietCheck, 30 * 60 * 1000));
+    this.addSettingTab(new RikkaSettingTab(this.app, this));
   }
 
   // The version actually installed on disk (Obsidian keeps the version it
@@ -1809,7 +1830,6 @@ module.exports = class RikkaPlugin extends Plugin {
       this.lastUpdateCheck = 0;
       console.warn("Rikka update check failed", error);
     }
-    this.getView()?.renderUpdateButton?.();
     return this.availableUpdate;
   }
 
