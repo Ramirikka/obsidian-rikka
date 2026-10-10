@@ -407,9 +407,33 @@
 }
 
 @media (max-width: 500px) {
-  .rikka-toolbar { min-height: 44px; }
-  .rikka-icon-button { width: 34px; height: 34px; }
-  .rikka-row { height: 34px; }
+  .rikka-view-host { --rikka-row-height: 42px; }
+  .rikka-view-host .rikka-binder { font-size: 16px; }
+  .rikka-toolbar { min-height: 50px; padding-left: 9px; padding-right: 8px; }
+  .rikka-brand { font-size: 13px; }
+  .rikka-project-picker { font-size: 15px; height: 38px; }
+  .rikka-icon-button { width: 42px; height: 42px; }
+  .rikka-icon-button svg { width: 18px; height: 18px; }
+  .rikka-target { min-height: 38px; gap: 10px; }
+  .rikka-target-label,
+  .rikka-target-button { font-size: 13px; }
+  .rikka-target-track { height: 5px; }
+  .rikka-section-heading { min-height: 40px; gap: 7px; }
+  .rikka-section-label { font-size: 16px; }
+  .rikka-disclosure { width: 22px; height: 32px; flex-basis: 22px; }
+  .rikka-disclosure svg { width: 17px; height: 17px; }
+  .rikka-section-icon { width: 20px; height: 22px; flex-basis: 20px; }
+  .rikka-scrivener-icon { width: 20px; height: 20px; }
+  .rikka-collection-heading { min-height: 38px; font-size: 15px; }
+  .rikka-row { height: var(--rikka-row-height); gap: 7px; font-size: 16px; }
+  .rikka-row-icon { flex-basis: 20px; }
+  .rikka-row-icon svg { width: 18px; height: 18px; }
+  .rikka-row-disclosure,
+  .rikka-disclosure-spacer { width: 19px; flex-basis: 19px; }
+  .rikka-row-status { font-size: 12px; padding: 2px 7px; }
+  .rikka-row-wordcount { font-size: 12px; }
+  .rikka-section-count { font-size: 13px; }
+  .rikka-empty { font-size: 14px; }
 }
 
 /* Rikka preference: keep note hover previews from covering the active board. */
