@@ -531,3 +531,61 @@ body.is-mobile .base-board-card { -webkit-touch-callout: none; -webkit-user-sele
 body.is-mobile .base-board-board { overscroll-behavior-x: contain; }
 .rikka-row-title { min-width: 0; }
 .rikka-board-card-input { background: var(--background-primary) !important; color: var(--text-normal); }
+
+/* ---- Current location ---- */
+.rikka-location {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.rikka-location-place {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--text-normal);
+  font-weight: 500;
+}
+.rikka-location-icon { display: inline-flex; color: var(--interactive-accent); flex: 0 0 auto; }
+.rikka-location-icon svg { width: 13px; height: 13px; }
+.rikka-location-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rikka-location-words { flex: 0 0 auto; color: var(--text-faint); }
+
+/* The folder/section you're working in: a quiet "you are here" state,
+   distinct from the selected document (filled accent). */
+.rikka-row.is-context:not(.is-selected),
+.rikka-section-heading.is-context,
+.rikka-collection-heading.is-context {
+  background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  border-radius: 6px;
+}
+.rikka-row.is-context:not(.is-selected) .rikka-row-title,
+.rikka-section-heading.is-context .rikka-section-label,
+.rikka-collection-heading.is-context .rikka-collection-name {
+  color: var(--interactive-accent);
+  font-weight: 600;
+}
+.rikka-section-heading,
+.rikka-collection-heading { cursor: pointer; }
+
+/* ---- Name dialog: title, path, input, Create ---- */
+.rikka-name-modal .rikka-name-modal-path {
+  margin: -6px 0 12px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rikka-name-modal-form { display: flex; flex-direction: column; gap: 12px; }
+.rikka-name-modal-input { width: 100%; }
+.rikka-name-modal-button { align-self: flex-end; }
+body.is-mobile .rikka-name-modal-input { font-size: 16px; min-height: 44px; } /* 16px stops iOS zooming */
+body.is-mobile .rikka-name-modal-button { align-self: stretch; min-height: 44px; }
+
+/* ---- Touch targets ---- */
+body.is-mobile .rikka-row-disclosure,
+body.is-mobile .rikka-disclosure { min-width: 32px; min-height: 40px; }
+body.is-mobile .rikka-toolbar-actions { gap: 4px; }
+body.is-mobile .rikka-location { min-height: 34px; padding-top: 2px; padding-bottom: 2px; }

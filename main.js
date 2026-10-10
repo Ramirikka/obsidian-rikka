@@ -1,7 +1,7 @@
 const { FuzzySuggestModal, ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon, parseYaml, stringifyYaml } = require("obsidian");
 
 const VIEW_TYPE = "rikka-binder";
-const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [] };
+const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [], context: { section: "draft", folder: "" } };
 const RIKKA_PROJECTS = [
   { id: "itl", name: "ITL", path: "ITL/ITL Obsidian" },
   { id: "cfi", name: "CFI", path: "CFI" },
@@ -69,45 +69,74 @@ class RikkaTextModal extends Modal {
   }
 }
 
+// Remembers meaningful text typed into a name dialog that was dismissed
+// without creating anything, so an accidental swipe never loses it.
+const RIKKA_NAME_DRAFTS = new Map();
+
 class RikkaNameModal extends Modal {
-  constructor(app, title, placeholder, onSubmit, buttonText = "Create", initialValue = "") {
+  constructor(app, title, placeholder, onSubmit, options = {}, legacyInitial = "") {
     super(app);
+    if (typeof options === "string") options = { buttonText: options, initialValue: legacyInitial };
     this.title = title;
     this.placeholder = placeholder;
     this.onSubmit = onSubmit;
-    this.buttonText = buttonText;
-    this.value = initialValue;
+    this.buttonText = options.buttonText || "Create";
+    this.subtitle = options.subtitle || "";
+    this.draftKey = options.draftKey || "";
+    this.value = options.initialValue || (this.draftKey && RIKKA_NAME_DRAFTS.get(this.draftKey)) || "";
+    this.submitted = false;
   }
 
   onOpen() {
+    this.modalEl.addClass("rikka-name-modal");
     this.setTitle(this.title);
-    new Setting(this.contentEl)
-      .setName("Name")
-      .addText((text) => {
-        text.setPlaceholder(this.placeholder).setValue(this.value || "").onChange((value) => { this.value = value; });
-        text.inputEl.addEventListener("keydown", (event) => {
-          if (event.key === "Enter") {
-            event.preventDefault();
-            void this.submit();
-          }
-        });
-        window.setTimeout(() => { text.inputEl.focus(); text.inputEl.select(); }, 0);
-      });
-    new Setting(this.contentEl).addButton((button) => {
-      button.setButtonText(this.buttonText).setCta().onClick(() => void this.submit());
+    if (this.subtitle) this.contentEl.createDiv({ cls: "rikka-name-modal-path", text: this.subtitle });
+    const form = this.contentEl.createEl("form", { cls: "rikka-name-modal-form" });
+    this.inputEl = form.createEl("input", {
+      cls: "rikka-name-modal-input",
+      attr: { type: "text", placeholder: this.placeholder, enterkeyhint: "done", autocapitalize: "sentences", autocomplete: "off", spellcheck: "false" },
     });
+    this.inputEl.value = this.value;
+    this.inputEl.addEventListener("input", () => { this.value = this.inputEl.value; });
+    const button = form.createEl("button", { cls: "mod-cta rikka-name-modal-button", text: this.buttonText, attr: { type: "submit" } });
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void this.submit();
+    });
+    this.buttonEl = button;
+    window.setTimeout(() => { this.inputEl.focus(); this.inputEl.select(); }, 0);
   }
 
   async submit() {
+    if (this.busy) return;
     const name = (this.value || "").trim();
     if (!name) return;
+    this.busy = true;
+    this.buttonEl?.setAttr("disabled", "true");
     try {
-      await this.onSubmit(name);
+      const result = await this.onSubmit(name);
+      if (result === false) { this.inputEl?.focus(); return; } // e.g. duplicate name: let them edit
+      this.submitted = true;
+      if (this.draftKey) RIKKA_NAME_DRAFTS.delete(this.draftKey);
+      this.inputEl?.blur(); // dismiss the keyboard before the dialog closes
       this.close();
     } catch (error) {
       console.error("Rikka action failed", error);
       new Notice(`Could not complete that action: ${error?.message || error}`);
+    } finally {
+      this.busy = false;
+      this.buttonEl?.removeAttribute("disabled");
     }
+  }
+
+  onClose() {
+    this.inputEl?.blur();
+    // Empty: nothing to keep. Meaningful unsaved text: keep it for next time.
+    if (!this.submitted && this.draftKey) {
+      const text = (this.value || "").trim();
+      if (text) RIKKA_NAME_DRAFTS.set(this.draftKey, text); else RIKKA_NAME_DRAFTS.delete(this.draftKey);
+    }
+    this.contentEl.empty();
   }
 }
 
@@ -150,14 +179,20 @@ class RikkaBinderView extends ItemView {
         this.plugin.runSafely(() => this.plugin.selectProject(projectPicker.value), "Switch project");
       }
     });
+    // "+" always means "add here": both create buttons use the current location.
     const actions = toolbar.createDiv({ cls: "rikka-toolbar-actions" });
-    this.makeToolbarButton(actions, "file-plus-2", "New document", () => this.plugin.promptNewNote());
-    this.makeToolbarButton(actions, "files", "New from template", () => this.plugin.promptNewFromTemplate());
-    this.makeToolbarButton(actions, "scroll-text", "Compile Draft to Markdown", () => this.plugin.compileDraft());
-    this.makeToolbarButton(actions, "folder-plus", "New folder", () => this.plugin.promptNewFolder());
-    this.makeToolbarButton(actions, "library", "New collection", () => this.plugin.promptNewCollection());
+    this.makeToolbarButton(actions, "file-plus-2", "New document here", () => this.plugin.promptNewNote());
+    this.makeToolbarButton(actions, "folder-plus", "New folder here", () => this.plugin.promptNewFolder());
+    this.makeToolbarButton(actions, "more-horizontal", "More", (event) => this.plugin.showToolbarMore(event));
 
-    const wordCount = root.createDiv({ cls: "rikka-target" });
+    // Location bar: where new things will go, plus the draft word count.
+    const location = root.createDiv({ cls: "rikka-target rikka-location" });
+    const place = location.createDiv({ cls: "rikka-location-place" });
+    setIcon(place.createSpan({ cls: "rikka-location-icon" }), "map-pin");
+    const where = this.plugin.contextInfo();
+    place.createSpan({ cls: "rikka-location-path", text: where.path });
+    place.setAttr("aria-label", `Current location: ${where.path}`);
+    const wordCount = location.createDiv({ cls: "rikka-location-words" });
     void this.plugin.renderDraftWordCount(wordCount);
 
     const scroll = root.createDiv({ cls: "rikka-scroll" });
@@ -179,6 +214,23 @@ class RikkaBinderView extends ItemView {
     }
   }
 
+  updateContextHighlight() {
+    const ctx = this.plugin.data.context;
+    this.containerEl.querySelectorAll(".is-context").forEach((el) => el.removeClass("is-context"));
+    if (ctx.folder) {
+      this.containerEl.querySelectorAll(`.rikka-section[data-section] .rikka-folder-row`).forEach((row) => {
+        const sectionEl = row.closest("[data-context-key]");
+        if (row.dataset.path === ctx.folder && sectionEl?.dataset.contextKey === ctx.section) row.addClass("is-context");
+      });
+    } else {
+      this.containerEl.querySelectorAll(`[data-context-section]`).forEach((el) => {
+        if (el.dataset.contextSection === ctx.section) el.addClass("is-context");
+      });
+    }
+    const label = this.containerEl.querySelector(".rikka-location-path");
+    if (label) label.setText(this.plugin.contextInfo().path);
+  }
+
   // Move the selection highlight without rebuilding the Binder.
   setSelected(path) {
     this.selectedPath = path;
@@ -191,7 +243,7 @@ class RikkaBinderView extends ItemView {
   makeToolbarButton(parent, icon, label, callback) {
     const button = parent.createEl("button", { cls: "rikka-icon-button", attr: { "aria-label": label, title: label } });
     setIcon(button, icon);
-    button.addEventListener("click", () => this.plugin.runSafely(callback, label));
+    button.addEventListener("click", (event) => this.plugin.runSafely(() => callback(event), label));
   }
 
   appendBinderImage(parent, name) {
@@ -209,6 +261,7 @@ class RikkaBinderView extends ItemView {
   renderSection(parent, key, label, icon, items, emptyText) {
     const section = parent.createDiv({ cls: "rikka-section" });
     section.dataset.section = key;
+    section.dataset.contextKey = key;
     section.addEventListener("dragover", (event) => { event.preventDefault(); section.addClass("rikka-drop-target"); });
     section.addEventListener("dragleave", () => section.removeClass("rikka-drop-target"));
     section.addEventListener("drop", (event) => {
@@ -226,11 +279,11 @@ class RikkaBinderView extends ItemView {
       }, "Move document");
     });
     section.addEventListener("contextmenu", (event) => {
-      if (key !== "draft") return;
+      if (key === "trash") return;
       event.preventDefault();
       const menu = new Menu();
-      menu.addItem((entry) => entry.setTitle("New document").setIcon("file-plus-2").onClick(() => this.plugin.promptNewNote()));
-      menu.addItem((entry) => entry.setTitle("New folder").setIcon("folder-plus").onClick(() => this.plugin.promptNewFolder()));
+      menu.addItem((entry) => entry.setTitle(`New document in ${label}`).setIcon("file-plus-2").onClick(() => this.plugin.promptNewNote({ section: key, folder: "" })));
+      menu.addItem((entry) => entry.setTitle(`New folder in ${label}`).setIcon("folder-plus").onClick(() => this.plugin.promptNewFolder({ section: key, folder: "" })));
       menu.showAtMouseEvent(event);
     });
 
@@ -250,9 +303,17 @@ class RikkaBinderView extends ItemView {
     }
     heading.createSpan({ cls: "rikka-section-label", text: label });
     heading.createSpan({ cls: "rikka-section-count", text: String(items.length) });
+    const ctx = this.plugin.data.context;
+    if (key !== "trash" && ctx.section === key && !ctx.folder) heading.addClass("is-context");
+    heading.dataset.contextSection = key;
     toggle.addEventListener("click", (event) => {
       event.stopPropagation();
       this.plugin.toggleCollapsed(`section:${key}`);
+    });
+    // Tap the heading (not the arrow) to work at the top level of this section.
+    if (key !== "trash") heading.addEventListener("click", (event) => {
+      if (event.target.closest("button")) return;
+      this.plugin.setContext(key, "", { expandSection: true });
     });
 
     if (collapsed) return;
@@ -279,7 +340,9 @@ class RikkaBinderView extends ItemView {
     }
     for (const [name, paths] of entries) {
       const group = section.createDiv({ cls: "rikka-custom-collection" });
+      group.dataset.contextKey = `collection:${name}`;
       const groupHeading = group.createDiv({ cls: "rikka-collection-heading" });
+      groupHeading.dataset.contextSection = `collection:${name}`;
       const files = paths.map((path) => this.plugin.app.vault.getAbstractFileByPath(path)).filter((file) => file instanceof TFile);
       const key = `collection:${name}`;
       const collapsed = Boolean(this.plugin.data.collapsed[key]);
@@ -294,6 +357,12 @@ class RikkaBinderView extends ItemView {
       groupHeading.addEventListener("contextmenu", (event) => {
         event.preventDefault();
         this.plugin.showCollectionMenu(name, event);
+      });
+      const ctx = this.plugin.data.context;
+      if (ctx.section === key && !ctx.folder) groupHeading.addClass("is-context");
+      groupHeading.addEventListener("click", (event) => {
+        if (event.target.closest("button")) return;
+        this.plugin.setContext(key, "", { expandSection: true });
       });
       if (collapsed) continue;
       const body = group.createDiv({ cls: "rikka-collection-body" });
@@ -311,7 +380,8 @@ class RikkaBinderView extends ItemView {
     if (isFile && item.extension === "canvas") row.addClass("rikka-canvas-row");
     row.style.setProperty("--rikka-depth", String(depth));
     row.dataset.path = item.path;
-    row.draggable = true;
+    // Drag to move on desktop; on touch, long-press → Move… is the reliable way.
+    row.draggable = !Platform.isMobile;
     row.addEventListener("dragstart", (event) => {
       // Register the drag with Obsidian's own drag manager so the item can also
       // be dropped on the core File explorer / editor like a native file drag.
@@ -362,9 +432,13 @@ class RikkaBinderView extends ItemView {
       const folderIcon = this.selectedPath === item.path ? "BinderGroupWhite@2x@2x.png" : "BinderGroup@2x@2x.png";
       this.appendBinderImage(icon, folderIcon);
       row.createSpan({ cls: "rikka-row-title", text: item.name });
+      const ctx = this.plugin.data.context;
+      if (ctx.section === sectionKey && ctx.folder === item.path) row.addClass("is-context");
       row.addEventListener("click", (event) => {
         if (event.target.closest("button")) return;
-        this.plugin.runSafely(() => this.plugin.toggleCollapsed(`folder:${sectionKey}:${item.path}`), "Toggle folder");
+        // Opening a folder makes it the current location and shows its contents.
+        // It never collapses it; the arrow is the only expand/collapse control.
+        this.plugin.setContext(sectionKey, item.path, { expandFolder: true });
       });
 
       if (!collapsed) {
@@ -398,6 +472,7 @@ class RikkaBinderView extends ItemView {
     if (Number.isFinite(cachedWords)) row.createSpan({ cls: "rikka-row-wordcount", text: `${cachedWords.toLocaleString()}w` });
     row.addEventListener("click", (event) => {
       this.setSelected(item.path);
+      this.plugin.setContextFromItem(item, sectionKey);
       const openInNewTab = !Platform.isMobile && (event.metaKey || event.ctrlKey);
       this.plugin.runSafely(() => this.plugin.openFile(item, openInNewTab), "Open document");
     });
@@ -452,6 +527,12 @@ module.exports = class RikkaPlugin extends Plugin {
       if (this.isInActiveProject(file.path)) this.refreshViews();
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (Platform.isMobile && file instanceof TFile && this.isInActiveProject(file.path)) {
+        window.setTimeout(() => {
+          const leaf = this.app.workspace.getMostRecentLeaf?.();
+          if (leaf?.view?.getViewType?.() === "empty") this.runSafely(() => this.activateView(), "Show Binder");
+        }, 150);
+      }
       void this.removeStoredPath(file.path).catch((error) => {
         console.error("Rikka cleanup after deletion failed", error);
         new Notice(`Could not update Rikka after deletion: ${error?.message || error}`);
@@ -481,7 +562,10 @@ module.exports = class RikkaPlugin extends Plugin {
     this.installMobileBoardSupport();
     this.installNewCardOpenGuard();
 
-    this.app.workspace.onLayoutReady(() => this.runSafely(() => this.activateView(), "Open Rikka Binder"));
+    this.app.workspace.onLayoutReady(() => {
+      this.validateContext();
+      this.runSafely(() => this.activateView(), "Open Rikka Binder");
+    });
   }
 
   onunload() {
@@ -601,18 +685,9 @@ module.exports = class RikkaPlugin extends Plugin {
   }
 
   async createBoardCard(column, title) {
-    let boardLeaf;
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      if (leaf.view?.containerEl?.contains(column)) boardLeaf = leaf;
-    });
-    const statePath = boardLeaf?.view?.getState?.()?.file;
-    const baseFile = boardLeaf?.view?.file || (statePath && this.app.vault.getAbstractFileByPath(statePath));
-    if (!(baseFile instanceof TFile) || baseFile.extension !== "base") {
-      throw new Error("Open the board as a page before adding an item.");
-    }
-    const definition = parseYaml(await this.app.vault.read(baseFile)) || {};
-    const config = (definition.views || []).find((view) => view.type === "base-board");
-    const groupProperty = (config?.groupBy?.property || "status").replace(/^note\./, "");
+    const info = await this.getBoardInfo(column);
+    if (!info) throw new Error("Open the board as a page before adding an item.");
+    const { baseFile, config, groupProperty } = info;
     const folder = config?.newItemFolder || baseFile.parent?.path || "";
     const safeTitle = title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, " — ").replace(/\s+/g, " ").trim().slice(0, 160);
     if (!safeTitle) throw new Error("Enter a title for the item.");
@@ -738,6 +813,54 @@ module.exports = class RikkaPlugin extends Plugin {
   }
 
 
+  // The .base file and grouping property behind a board element.
+  async getBoardInfo(el) {
+    let boardLeaf;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view?.containerEl?.contains(el)) boardLeaf = leaf;
+    });
+    const statePath = boardLeaf?.view?.getState?.()?.file;
+    const baseFile = boardLeaf?.view?.file || (statePath && this.app.vault.getAbstractFileByPath(statePath));
+    if (!(baseFile instanceof TFile) || baseFile.extension !== "base") return null;
+    const definition = parseYaml(await this.app.vault.read(baseFile)) || {};
+    const config = (definition.views || []).find((view) => view.type === "base-board");
+    return { leaf: boardLeaf, baseFile, config, groupProperty: (config?.groupBy?.property || "status").replace(/^note\./, "") };
+  }
+
+  showCardMenu(card, point) {
+    const file = this.app.vault.getAbstractFileByPath(card.dataset.filePath);
+    if (!(file instanceof TFile)) return;
+    const menu = new Menu();
+    const safe = (action, label) => () => this.runSafely(action, label);
+    menu.addItem((entry) => entry.setTitle("Open").setIcon("file").onClick(() => {
+      this.newCardPaths?.delete(file.path);
+      let leaf = null;
+      this.app.workspace.iterateAllLeaves((candidate) => { if (!leaf && candidate.view?.containerEl?.contains(card)) leaf = candidate; });
+      this.rememberBoardScroll(card, leaf);
+      (leaf || this.app.workspace.getLeaf(false)).openFile(file, { active: true });
+    }));
+    menu.addItem((entry) => entry.setTitle("Rename…").setIcon("pencil").onClick(() => this.promptRename(file)));
+    menu.addItem((entry) => entry.setTitle("Move to column…").setIcon("columns-3").onClick(safe(async () => {
+      const board = card.closest(".base-board-board");
+      const current = card.closest(".base-board-column")?.dataset.columnName;
+      const names = Array.from(board?.querySelectorAll(".base-board-column") || []).map((column) => column.dataset.columnName).filter(Boolean);
+      const info = await this.getBoardInfo(card);
+      if (!info) throw new Error("Couldn't find this board's settings.");
+      const choices = names.map((name) => ({ value: name, label: name === current ? `${name}  · current` : name }));
+      new RikkaChoiceModal(this.app, `Move “${file.basename}” to column…`, choices, (name) => {
+        if (name === current) return;
+        return this.app.fileManager.processFrontMatter(file, (fm) => { fm[info.groupProperty] = name; });
+      }).open();
+    }, "Move to column")));
+    menu.addSeparator();
+    menu.addItem((entry) => entry.setTitle("Delete").setIcon("trash-2").setWarning(true).onClick(safe(async () => {
+      // Uses Obsidian's own trash setting (system trash or .trash), so it's recoverable.
+      await this.app.fileManager.trashFile(file);
+      new Notice(`Deleted “${file.basename}”.`);
+    }, "Delete card")));
+    menu.showAtPosition(point);
+  }
+
   rememberBoardScroll(card, leaf) {
     const board = card.closest(".base-board-board");
     const basePath = leaf?.view?.file?.path || leaf?.view?.getState?.()?.file;
@@ -752,6 +875,13 @@ module.exports = class RikkaPlugin extends Plugin {
 
   installMobileBoardSupport() {
     if (!Platform.isMobile) return;
+    // One gesture = one menu: Rikka's long-press menu replaces the long-press
+    // context menu on board cards, so two menus never stack up.
+    this.registerDomEvent(document, "contextmenu", (event) => {
+      if (!event.target?.closest?.(".base-board-card")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
     this.mobileDragClickSuppression = 0;
     this.mobileBoardCleanups = new Set();
     this.registerDomEvent(document, "keydown", (event) => {
@@ -828,6 +958,7 @@ module.exports = class RikkaPlugin extends Plugin {
             return;
           }
           event.preventDefault();
+          if (Math.hypot(touch.clientX - state.x, touch.clientY - state.y) > 8) state.moved = true;
           const target = document.elementFromPoint(touch.clientX, touch.clientY);
           if (!target || !board.contains(target)) return;
           manager.updateAutoScroll(touch.clientX, touch.clientY, target);
@@ -841,6 +972,13 @@ module.exports = class RikkaPlugin extends Plugin {
           state = null;
           if (!drag.active) return;
           this.mobileDragClickSuppression = Date.now() + 700;
+          // Held without moving: that's a long-press, not a drag. Cancel the
+          // drag (card stays put) and show the card's actions instead.
+          if (!drag.moved) {
+            if (manager.dragType) manager.onDragEnd();
+            this.showCardMenu(drag.card, { x: drag.x, y: drag.y });
+            return;
+          }
           const touch = event.changedTouches && Array.from(event.changedTouches).find((item) => item.identifier === drag.id);
           const x = touch?.clientX ?? drag.lastX;
           const y = touch?.clientY ?? drag.lastY;
@@ -940,7 +1078,12 @@ module.exports = class RikkaPlugin extends Plugin {
     state.trash = this.asPathList(state.trash);
     state.templates = this.asPathList(state.templates);
     state.collections = this.asCollections(state.collections);
+    state.context = this.asRecord(state.context);
     for (const key of Object.keys(DEFAULT_DATA)) this.data[key] = state[key];
+    // Before the layout is ready the file tree may still be loading (especially
+    // on mobile), so only check the folder still exists once it is.
+    if (this.app.workspace.layoutReady) this.validateContext();
+    else this.data.context = { section: this.data.context.section || "draft", folder: this.data.context.folder || "" };
   }
 
   captureActiveProjectState() {
@@ -975,7 +1118,7 @@ module.exports = class RikkaPlugin extends Plugin {
       const project = { id, name: folderName, path };
       this.projects.push(project);
       this.data.projects = this.projects;
-      this.data.projectStates[id] = Object.assign({}, DEFAULT_DATA, { collapsed: {}, research: [], trash: [], collections: {}, templates: [] });
+      this.data.projectStates[id] = Object.assign({}, DEFAULT_DATA, { collapsed: {}, research: [], trash: [], collections: {}, templates: [], context: { section: "draft", folder: "" } });
       await this.selectProject(id);
       new Notice(`${folderName} is ready in LIFE2.0.`);
     }).open();
@@ -1011,7 +1154,7 @@ module.exports = class RikkaPlugin extends Plugin {
 
   async renameStoredPath(oldPath, newPath) {
     if (!oldPath || !newPath || oldPath === newPath) return;
-    const before = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed]);
+    const before = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed, this.data.context]);
     const migrate = (paths) => [...new Set(paths.map((path) => this.replaceStoredPath(path, oldPath, newPath)))];
     this.data.research = migrate(this.data.research);
     this.data.trash = migrate(this.data.trash);
@@ -1035,8 +1178,13 @@ module.exports = class RikkaPlugin extends Plugin {
         this.wordCountCache.set(this.replaceStoredPath(path, oldPath, newPath), value);
       }
     }
+    // Renaming/moving the current folder (here or via sync) keeps it current.
+    if (this.data.context?.folder && this.pathIsWithin(this.data.context.folder, oldPath)) {
+      this.data.context.folder = this.replaceStoredPath(this.data.context.folder, oldPath, newPath);
+    }
+    this.validateContext();
     await this.renameSnapshotSources(oldPath, newPath);
-    const after = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed]);
+    const after = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed, this.data.context]);
     if (before !== after) await this.saveState();
   }
 
@@ -1055,7 +1203,7 @@ module.exports = class RikkaPlugin extends Plugin {
 
   async removeStoredPath(deletedPath) {
     if (!deletedPath) return;
-    const before = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed]);
+    const before = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed, this.data.context]);
     const remove = (paths) => paths.filter((path) => !this.pathIsWithin(path, deletedPath));
     this.data.research = remove(this.data.research);
     this.data.trash = remove(this.data.trash);
@@ -1063,7 +1211,8 @@ module.exports = class RikkaPlugin extends Plugin {
     for (const name of Object.keys(this.data.collections)) this.data.collections[name] = remove(this.data.collections[name]);
     this.removeCollapsedPath(deletedPath);
     for (const path of this.wordCountCache.keys()) if (this.pathIsWithin(path, deletedPath)) this.wordCountCache.delete(path);
-    const after = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed]);
+    this.validateContext(); // a deleted current folder falls back to its parent
+    const after = JSON.stringify([this.data.research, this.data.trash, this.data.templates, this.data.collections, this.data.collapsed, this.data.context]);
     if (before !== after) await this.saveState();
   }
 
@@ -1299,22 +1448,25 @@ module.exports = class RikkaPlugin extends Plugin {
       new Notice("Right-click a document and choose Save as template first.");
       return;
     }
+    const info = this.resolveCreateTarget();
     const choices = templates.map((file) => ({ value: file.path, label: file.basename }));
-    new RikkaChoiceModal(this.app, "New document from template", choices, async (path) => {
+    new RikkaChoiceModal(this.app, `Template for a new document in ${info.name}`, choices, async (path) => {
       const template = this.app.vault.getAbstractFileByPath(path);
       if (!(template instanceof TFile)) return;
-      new RikkaNameModal(this.app, "Name the new document", "Document title", async (name) => {
+      new RikkaNameModal(this.app, `New document in ${info.name}`, "Document title", async (name) => {
         const safe = this.safeName(name);
-        const targetPath = `${this.activeProject.path}/${safe}.md`;
-        if (!safe || this.app.vault.getAbstractFileByPath(targetPath)) {
-          new Notice("Enter a unique document name.");
-          return;
+        if (!safe) return false;
+        const targetPath = `${info.targetPath}/${safe}.md`;
+        if (this.app.vault.getAbstractFileByPath(targetPath)) {
+          new Notice(`“${safe}” already exists in ${info.name}.`);
+          return false;
         }
         const content = await this.app.vault.cachedRead(template);
         const created = await this.app.vault.create(targetPath, content);
+        await this.registerInSection(info, created.path);
+        await this.saveState();
         await this.openFile(created);
-        this.refreshViews();
-      }).open();
+      }, { subtitle: `${info.path} · from “${template.basename}”`, draftKey: `template:${info.targetPath}` }).open();
     }).open();
   }
 
@@ -1371,33 +1523,171 @@ module.exports = class RikkaPlugin extends Plugin {
     if (file instanceof TFolder) this.refreshViews();
   }
 
-  async promptNewNote(folderPath = "") {
-    new RikkaNameModal(this.app, "New document", "Document title", async (name) => {
-      const safe = this.safeName(name);
-      if (!safe) return;
-      const path = folderPath ? `${folderPath}/${safe}.md` : `${this.activeProject.path}/${safe}.md`;
-      if (this.app.vault.getAbstractFileByPath(path)) {
-        new Notice("A document with that name already exists here.");
-        return;
-      }
-      const file = await this.app.vault.create(path, "");
-      await this.openFile(file);
-      this.refreshViews();
-    }).open();
+  // ---- Current location ("context") -------------------------------------
+  // The Binder always has one current location: a section (Draft, Research or
+  // a collection) and optionally a folder inside it. Every "new" action uses
+  // it, so things are created where the user is looking.
+
+  sectionLabel(section) {
+    if (section === "research") return "Research";
+    if (section?.startsWith("collection:")) return section.slice("collection:".length);
+    return "Draft";
   }
 
-  async promptNewFolder(parentPath = "") {
-    new RikkaNameModal(this.app, "New folder", "Folder name", async (name) => {
+  validateContext() {
+    const ctx = this.asRecord(this.data.context);
+    let section = typeof ctx.section === "string" ? ctx.section : "draft";
+    if (section.startsWith("collection:") && !this.data.collections?.[section.slice(11)]) section = "draft";
+    if (!["draft", "research"].includes(section) && !section.startsWith("collection:")) section = "draft";
+    let folder = typeof ctx.folder === "string" ? ctx.folder : "";
+    // A folder that was deleted, renamed or synced away falls back to its
+    // nearest surviving parent inside the project (never a stale path).
+    while (folder && !(this.app.vault.getAbstractFileByPath(folder) instanceof TFolder)) {
+      folder = folder.includes("/") ? folder.slice(0, folder.lastIndexOf("/")) : "";
+    }
+    if (folder && (!this.isInActiveProject(folder) || folder === this.activeProject.path)) folder = "";
+    this.data.context = { section, folder };
+    return this.data.context;
+  }
+
+  contextInfo(ctx = this.data.context) {
+    const section = ctx?.section || "draft";
+    const folder = ctx?.folder || "";
+    const root = this.activeProject.path;
+    const crumbs = [this.sectionLabel(section)];
+    if (folder) {
+      const relative = this.pathIsWithin(folder, root) ? folder.slice(root.length + 1) : folder;
+      crumbs.push(...relative.split("/").filter(Boolean));
+    }
+    return {
+      section,
+      folder,
+      name: crumbs[crumbs.length - 1],
+      path: crumbs.join(" / "),
+      // Where new files physically go: the folder, else the project root.
+      targetPath: folder || root,
+    };
+  }
+
+  setContext(section, folder = "", options = {}) {
+    this.data.context = { section, folder };
+    this.validateContext();
+    if (options.expandFolder && folder) {
+      const key = `folder:${section}:${folder}`;
+      // Reveal the folder and its parents; never collapse anything here.
+      for (let path = folder; path && this.pathIsWithin(path, this.activeProject.path) && path !== this.activeProject.path; path = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "") {
+        this.data.collapsed[`folder:${section}:${path}`] = false;
+      }
+      this.data.collapsed[key] = false;
+    }
+    if (options.expandSection) {
+      if (section.startsWith("collection:")) this.data.collapsed[section] = false;
+      else this.data.collapsed[`section:${section}`] = false;
+    }
+    void this.saveState();
+  }
+
+  setContextFromItem(item, section) {
+    if (section === "trash") return;
+    const parent = item.parent?.path;
+    const roots = section === "research" ? this.data.research
+      : section.startsWith("collection:") ? (this.data.collections[section.slice(11)] || [])
+      : [this.activeProject.path];
+    const usable = parent && parent !== "/" && parent !== this.activeProject.path
+      && this.isInActiveProject(parent) && roots.some((root) => this.pathIsWithin(parent, root));
+    const folder = usable ? parent : "";
+    const ctx = this.data.context;
+    if (ctx.section === section && ctx.folder === folder) return;
+    this.data.context = { section, folder };
+    this.validateContext();
+    // Update highlights quietly; opening a document shouldn't rebuild the Binder.
+    this.saveData(this.captureAndReturnData()).catch((error) => console.error("Rikka state save failed", error));
+    this.getView()?.updateContextHighlight();
+  }
+
+  captureAndReturnData() {
+    this.captureActiveProjectState();
+    return this.data;
+  }
+
+  // Normalise the target for a create action: explicit {section, folder},
+  // a folder path string (Draft), or nothing (= the current location).
+  resolveCreateTarget(target) {
+    if (typeof target === "string") return this.contextInfo({ section: "draft", folder: target === this.activeProject.path ? "" : target });
+    if (target && typeof target === "object") return this.contextInfo(target);
+    return this.contextInfo(this.validateContext());
+  }
+
+  // After creating something at the top level of Research or a collection,
+  // register it there so it shows up where the user created it.
+  async registerInSection(info, path) {
+    if (info.folder) return;
+    if (info.section === "research") {
+      if (!this.data.research.includes(path)) this.data.research.push(path);
+    } else if (info.section.startsWith("collection:")) {
+      const name = info.section.slice(11);
+      const paths = this.data.collections[name] || [];
+      if (!paths.includes(path)) this.data.collections[name] = [...paths, path];
+    }
+  }
+
+  async promptNewNote(target) {
+    const info = this.resolveCreateTarget(target);
+    if (!(this.app.vault.getAbstractFileByPath(info.targetPath) instanceof TFolder)) {
+      new Notice(`The folder “${info.path}” no longer exists.`);
+      return;
+    }
+    new RikkaNameModal(this.app, `New document in ${info.name}`, "Document title", async (name) => {
       const safe = this.safeName(name);
       if (!safe) return;
-      const path = parentPath ? `${parentPath}/${safe}` : `${this.activeProject.path}/${safe}`;
+      const path = `${info.targetPath}/${safe}.md`;
       if (this.app.vault.getAbstractFileByPath(path)) {
-        new Notice("A folder or document with that name already exists here.");
-        return;
+        new Notice(`“${safe}” already exists in ${info.name}.`);
+        return false;
+      }
+      const file = await this.app.vault.create(path, "");
+      await this.registerInSection(info, file.path);
+      // Keep working in the same place, with the new document visible and selected.
+      this.data.context = { section: info.section, folder: info.folder };
+      if (info.folder) this.data.collapsed[`folder:${info.section}:${info.folder}`] = false;
+      await this.saveState();
+      this.getView() && (this.getView().selectedPath = file.path);
+      // Creating a document is a writing workflow: open it.
+      await this.openFile(file);
+    }, { buttonText: "Create", subtitle: info.path, draftKey: `note:${info.section}:${info.targetPath}` }).open();
+  }
+
+  async promptNewFolder(target) {
+    const info = this.resolveCreateTarget(target);
+    if (!(this.app.vault.getAbstractFileByPath(info.targetPath) instanceof TFolder)) {
+      new Notice(`The folder “${info.path}” no longer exists.`);
+      return;
+    }
+    new RikkaNameModal(this.app, `New folder in ${info.name}`, "Folder name", async (name) => {
+      const safe = this.safeName(name);
+      if (!safe) return;
+      const path = `${info.targetPath}/${safe}`;
+      if (this.app.vault.getAbstractFileByPath(path)) {
+        new Notice(`“${safe}” already exists in ${info.name}.`);
+        return false;
       }
       await this.app.vault.createFolder(path);
-      this.refreshViews();
-    }).open();
+      await this.registerInSection(info, path);
+      // Stay in the current location; show the new folder inside it.
+      if (info.folder) this.data.collapsed[`folder:${info.section}:${info.folder}`] = false;
+      await this.saveState();
+    }, { buttonText: "Create", subtitle: info.path, draftKey: `folder:${info.section}:${info.targetPath}` }).open();
+  }
+
+  showToolbarMore(event) {
+    const menu = new Menu();
+    const info = this.contextInfo();
+    menu.addItem((entry) => entry.setTitle(`New from template in ${info.name}…`).setIcon("files").onClick(() => this.promptNewFromTemplate()));
+    menu.addItem((entry) => entry.setTitle("New collection…").setIcon("library").onClick(() => this.promptNewCollection()));
+    menu.addSeparator();
+    menu.addItem((entry) => entry.setTitle("Compile Draft to Markdown").setIcon("scroll-text").onClick(() => this.runSafely(() => this.compileDraft(), "Compile Draft")));
+    if (event instanceof MouseEvent) menu.showAtMouseEvent(event);
+    else menu.showAtPosition({ x: 0, y: 0 });
   }
 
   async moveIntoFolder(path, folder) {
@@ -1417,21 +1707,37 @@ module.exports = class RikkaPlugin extends Plugin {
     this.refreshViews();
   }
 
-  promptMoveToFolder(item) {
+  // Mobile-friendly move: one flat list of destinations ("Draft / A / B"),
+  // current location marked, tap to move. No tree, no typing paths.
+  promptMoveToFolder(item, section = "draft") {
     const root = this.app.vault.getAbstractFileByPath(this.activeProject.path);
     if (!(root instanceof TFolder)) return;
-    const folders = [];
+    const inResearch = this.data.research.includes(item.path);
+    const currentParent = item.parent?.path === root.path ? "" : item.parent?.path;
+    const choices = [];
+    const label = (path) => this.contextInfo({ section: "draft", folder: path }).path;
+    const mark = (text, isCurrent) => isCurrent ? `${text}  · current` : text;
+    choices.push({ value: { kind: "folder", path: root.path }, label: mark("Draft (top level)", !inResearch && !currentParent) });
     const walk = (folder) => {
-      if (item instanceof TFolder && (folder.path === item.path || folder.path.startsWith(`${item.path}/`))) return;
-      folders.push(folder);
-      for (const child of folder.children) if (child instanceof TFolder) walk(child);
+      for (const child of [...folder.children].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))) {
+        if (!(child instanceof TFolder) || child.name === "_Rikka") continue;
+        if (item instanceof TFolder && this.pathIsWithin(child.path, item.path)) continue;
+        choices.push({ value: { kind: "folder", path: child.path }, label: mark(label(child.path), !inResearch && child.path === currentParent) });
+        walk(child);
+      }
     };
     walk(root);
-    const choices = folders
-      .filter((folder) => folder !== item.parent)
-      .map((folder) => ({ value: folder.path, label: folder === root ? "Draft (top level)" : folder.path.slice(root.path.length + 1) }));
-    new RikkaChoiceModal(this.app, `Move · ${item.name}`, choices, (path) => this.runSafely(
-      () => this.moveIntoFolder(item.path, this.app.vault.getAbstractFileByPath(path)), "Move to folder")).open();
+    choices.push({ value: { kind: "research" }, label: mark("Research", inResearch) });
+    new RikkaChoiceModal(this.app, `Move “${item.name}” to…`, choices, (dest) => this.runSafely(async () => {
+      if (dest.kind === "research") {
+        await this.moveToCollection(item.path, "research");
+      } else {
+        const folder = this.app.vault.getAbstractFileByPath(dest.path);
+        if (inResearch || this.data.trash.includes(item.path)) await this.moveToCollection(item.path, "draft");
+        await this.moveIntoFolder(item.path, folder);
+      }
+      new Notice(`Moved “${item.name}” to ${dest.kind === "research" ? "Research" : label(dest.path === root.path ? "" : dest.path)}.`);
+    }, "Move")).open();
   }
 
   safeName(value) {
@@ -1446,57 +1752,73 @@ module.exports = class RikkaPlugin extends Plugin {
     await this.saveState();
   }
 
+  // Short, contextual menus. Folder: create inside / rename / move / trash.
+  // Document: open / rename / move / duplicate / details… / trash.
   showItemMenu(item, section, event) {
     const menu = new Menu();
     const safe = (action, label) => () => this.runSafely(action, label);
     const isFile = item instanceof TFile;
-    const inDraft = section === "draft";
+    const point = { x: event.clientX, y: event.clientY };
 
-    // 1. Open
+    if (section === "trash") {
+      menu.addItem((entry) => entry.setTitle("Restore").setIcon("rotate-ccw").onClick(safe(() => this.moveToCollection(item.path, "draft"), "Restore")));
+      menu.showAtMouseEvent(event);
+      return;
+    }
+
     if (isFile) {
-      menu.addItem((entry) => entry.setTitle("Open in new tab").setIcon("file-plus-2").onClick(safe(() => this.openFile(item, true), "Open in new tab")));
-      if (!Platform.isPhone) menu.addItem((entry) => entry.setTitle("Open to the right").setIcon("columns-2").onClick(safe(() => this.openFile(item, false, true), "Open to the right")));
-      menu.addSeparator();
+      menu.addItem((entry) => entry.setTitle("Open").setIcon("file").onClick(safe(() => { this.getView()?.setSelected(item.path); this.setContextFromItem(item, section); return this.openFile(item); }, "Open")));
+      if (!Platform.isMobile) menu.addItem((entry) => entry.setTitle("Open in new tab").setIcon("file-plus-2").onClick(safe(() => this.openFile(item, true), "Open in new tab")));
+    } else {
+      const here = { section, folder: item.path };
+      menu.addItem((entry) => entry.setTitle("New document").setIcon("file-plus-2").onClick(() => this.promptNewNote(here)));
+      menu.addItem((entry) => entry.setTitle("New folder").setIcon("folder-plus").onClick(() => this.promptNewFolder(here)));
     }
-
-    // 2. Create
-    if (inDraft) {
-      const parentPath = isFile ? (item.parent?.path && item.parent.path !== "/" ? item.parent.path : "") : item.path;
-      const where = isFile ? "here" : "inside";
-      menu.addItem((entry) => entry.setTitle(`New document ${where}`).setIcon("file-plus-2").onClick(() => this.promptNewNote(parentPath)));
-      menu.addItem((entry) => entry.setTitle(`New folder ${where}`).setIcon("folder-plus").onClick(() => this.promptNewFolder(parentPath)));
-      menu.addSeparator();
-    }
-
-    // 3. Organize
+    menu.addSeparator();
     menu.addItem((entry) => entry.setTitle("Rename…").setIcon("pencil").onClick(() => this.promptRename(item)));
-    if (inDraft) menu.addItem((entry) => entry.setTitle("Move to folder…").setIcon("folder-input").onClick(() => this.promptMoveToFolder(item)));
-    if (isFile) menu.addItem((entry) => entry.setTitle("Add to collection…").setIcon("library").onClick(() => this.addToCollection(item)));
-    if (inDraft || section.startsWith("collection:")) {
-      menu.addItem((entry) => entry.setTitle("Move to Research").setIcon("book-open").onClick(safe(() => this.moveToCollection(item.path, "research"), "Move to Research")));
-    } else if (section === "research") {
-      menu.addItem((entry) => entry.setTitle("Move to Draft").setIcon("file-text").onClick(safe(() => this.moveToCollection(item.path, "draft"), "Move to Draft")));
+    menu.addItem((entry) => entry.setTitle("Move…").setIcon("folder-input").onClick(() => this.promptMoveToFolder(item, section)));
+    if (isFile) {
+      menu.addItem((entry) => entry.setTitle("Duplicate").setIcon("copy").onClick(safe(() => this.duplicateFile(item), "Duplicate")));
+      menu.addItem((entry) => entry.setTitle("Details…").setIcon("sliders-horizontal").onClick(() => {
+        // Opened after this menu closes, at the same spot.
+        window.setTimeout(() => this.showDetailsMenu(item, section, point), 50);
+      }));
     }
+    menu.addSeparator();
+    if (section.startsWith("collection:")) {
+      const name = section.slice("collection:".length);
+      menu.addItem((entry) => entry.setTitle("Remove from collection").setIcon("list-minus").onClick(safe(() => this.removeFromCollection(name, item.path), "Remove from collection")));
+    }
+    menu.addItem((entry) => entry.setTitle("Move to Trash").setIcon("trash-2").setWarning(true).onClick(safe(async () => {
+      await this.moveToCollection(item.path, "trash");
+      new Notice(`Moved “${item.name}” to Trash. Restore it from Trash in the Binder.`);
+    }, "Move to Trash")));
+    menu.showAtMouseEvent(event);
+  }
 
-    // 4. Document details (Markdown only)
-    if (isFile && item.extension === "md") {
-      menu.addSeparator();
-      menu.addItem((entry) => entry.setTitle("Set status…").setIcon("badge-check").onClick(() => {
+  // Less frequent document actions, kept out of the main long-press menu.
+  showDetailsMenu(item, section, point) {
+    const menu = new Menu();
+    const safe = (action, label) => () => this.runSafely(action, label);
+    if (item.extension === "md") {
+      menu.addItem((entry) => entry.setTitle("Status…").setIcon("badge-check").onClick(() => {
         const choices = ["Draft", "Revised", "Final", "Needs work", "Research"].map((value) => ({ value, label: value }));
         new RikkaChoiceModal(this.app, `Status for ${item.basename}`, choices, (value) => this.setFileProperty(item, "rikka_status", value)).open();
       }));
-      menu.addItem((entry) => entry.setTitle("Set color label…").setIcon("paintbrush").onClick(() => {
+      menu.addItem((entry) => entry.setTitle("Color label…").setIcon("paintbrush").onClick(() => {
         const choices = Object.keys(RIKKA_LABELS).map((value) => ({ value, label: value }));
         new RikkaChoiceModal(this.app, `Color label for ${item.basename}`, choices, (value) => this.setFileProperty(item, "rikka_label", value)).open();
       }));
-      menu.addItem((entry) => entry.setTitle("Set icon…").setIcon("star").onClick(() => {
+      menu.addItem((entry) => entry.setTitle("Icon…").setIcon("star").onClick(() => {
         const choices = [{ value: "", label: "Default" }, ...RIKKA_ICONS.map((value) => ({ value, label: value }))];
         new RikkaChoiceModal(this.app, `Icon for ${item.basename}`, choices, (value) => this.setFileProperty(item, "rikka_icon", value)).open();
       }));
-      menu.addItem((entry) => entry.setTitle("Edit synopsis…").setIcon("align-left").onClick(() => {
+      menu.addItem((entry) => entry.setTitle("Synopsis…").setIcon("align-left").onClick(() => {
         const synopsis = this.app.metadataCache.getFileCache(item)?.frontmatter?.rikka_synopsis || "";
         new RikkaTextModal(this.app, `Synopsis · ${item.basename}`, synopsis, (value) => this.setFileProperty(item, "rikka_synopsis", value)).open();
       }));
+      menu.addItem((entry) => entry.setTitle("Clear status & label").setIcon("eraser").onClick(safe(() => this.clearRikkaLabels(item), "Clear status & label")));
+      menu.addSeparator();
       const included = this.app.metadataCache.getFileCache(item)?.frontmatter?.rikka_include !== false;
       menu.addItem((entry) => entry.setTitle(included ? "Exclude from compile" : "Include in compile").setIcon(included ? "circle-minus" : "circle-check").onClick(safe(() => this.setFileProperty(item, "rikka_include", included ? false : true), "Update compile setting")));
       const isTemplate = (this.data.templates || []).includes(item.path);
@@ -1506,25 +1828,27 @@ module.exports = class RikkaPlugin extends Plugin {
         await this.saveState();
         new Notice(isTemplate ? "Removed from templates." : "Saved as a template.");
       }, isTemplate ? "Remove template" : "Save template")));
-      menu.addItem((entry) => entry.setTitle("Clear status & label").setIcon("eraser").onClick(safe(() => this.clearRikkaLabels(item), "Clear status & label")));
-
-      menu.addSeparator();
       menu.addItem((entry) => entry.setTitle("Take snapshot").setIcon("history").onClick(safe(() => this.takeSnapshot(item), "Take snapshot")));
       menu.addItem((entry) => entry.setTitle("Compare with latest snapshot").setIcon("git-compare").onClick(safe(() => this.openLatestSnapshotBeside(item), "Compare with snapshot")));
+      menu.addSeparator();
     }
+    menu.addItem((entry) => entry.setTitle("Add to collection…").setIcon("library").onClick(() => this.addToCollection(item)));
+    if (!Platform.isPhone) menu.addItem((entry) => entry.setTitle("Open to the right").setIcon("columns-2").onClick(safe(() => this.openFile(item, false, true), "Open to the right")));
+    menu.showAtPosition(point);
+  }
 
-    // 5. Remove (kept last and marked as destructive)
-    menu.addSeparator();
-    if (section === "trash") {
-      menu.addItem((entry) => entry.setTitle("Restore to Draft").setIcon("rotate-ccw").onClick(safe(() => this.moveToCollection(item.path, "draft"), "Restore to Draft")));
-    } else {
-      if (section.startsWith("collection:")) {
-        const name = section.slice("collection:".length);
-        menu.addItem((entry) => entry.setTitle("Remove from collection").setIcon("list-minus").onClick(safe(() => this.removeFromCollection(name, item.path), "Remove from collection")));
-      }
-      menu.addItem((entry) => entry.setTitle("Move to Rikka Trash").setIcon("trash-2").setWarning(true).onClick(safe(() => this.moveToCollection(item.path, "trash"), "Move to Rikka Trash")));
+  async duplicateFile(file) {
+    const parent = file.parent?.path && file.parent.path !== "/" ? `${file.parent.path}/` : "";
+    let path = `${parent}${file.basename} copy.${file.extension}`;
+    for (let n = 2; this.app.vault.getAbstractFileByPath(path); n++) path = `${parent}${file.basename} copy ${n}.${file.extension}`;
+    const created = await this.app.vault.copy(file, path);
+    for (const name of Object.keys(this.data.collections)) {
+      if (this.data.collections[name].includes(file.path)) this.data.collections[name].push(created.path);
     }
-    menu.showAtMouseEvent(event);
+    if (this.data.research.includes(file.path)) this.data.research.push(created.path);
+    await this.saveState();
+    this.getView() && (this.getView().selectedPath = created.path);
+    new Notice(`Duplicated as “${created.basename}”.`);
   }
 
   promptRename(item) {
@@ -1544,6 +1868,6 @@ module.exports = class RikkaPlugin extends Plugin {
         return;
       }
       await this.app.fileManager.renameFile(item, target);
-    }, "Rename", current).open();
+    }, { buttonText: "Rename", initialValue: current }).open();
   }
 };
