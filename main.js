@@ -771,6 +771,7 @@ module.exports = class RikkaPlugin extends Plugin {
     this.installMobileBoardSupport();
     this.installNewCardOpenGuard();
     this.installEditorFeatures();
+    this.installSelfUpdater();
 
     this.app.workspace.onLayoutReady(() => {
       this.validateContext();
@@ -1736,6 +1737,66 @@ module.exports = class RikkaPlugin extends Plugin {
   async openFolder(folder) {
     const file = this.app.vault.getAbstractFileByPath(folder.path);
     if (file instanceof TFolder) this.refreshViews();
+  }
+
+  // ---- Self-update (requested by the vault owner) ------------------------
+  // iOS rarely restarts Obsidian, so BRAT's "update at startup" almost never
+  // runs on iPhone. Rikka checks its own GitHub releases when Obsidian opens,
+  // when it returns to the foreground, and every 30 minutes; a newer release
+  // is downloaded (from this repository only) and Rikka reloads itself.
+  installSelfUpdater() {
+    this.addCommand({ id: "check-for-update", name: "Check for Rikka update", icon: "refresh-cw", callback: () => this.checkForSelfUpdate(true) });
+    const check = () => void this.checkForSelfUpdate(false);
+    this.app.workspace.onLayoutReady(() => window.setTimeout(check, 4000));
+    this.registerDomEvent(document, "visibilitychange", () => { if (document.visibilityState === "visible") check(); });
+    this.registerInterval(window.setInterval(check, 30 * 60 * 1000));
+  }
+
+  async checkForSelfUpdate(manual) {
+    if (this.selfUpdating) return;
+    const now = Date.now();
+    if (!manual && this.lastUpdateCheck && now - this.lastUpdateCheck < 60 * 1000) return;
+    this.lastUpdateCheck = now;
+    this.selfUpdating = true;
+    try {
+      const { requestUrl } = require("obsidian");
+      const base = "https://github.com/Ramirikka/obsidian-rikka/releases/latest/download/";
+      const bust = `?t=${now}`;
+      const remote = (await requestUrl({ url: `${base}manifest.json${bust}` })).json;
+      const newer = (a, b) => {
+        const pa = String(a).split(".").map(Number);
+        const pb = String(b).split(".").map(Number);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+          if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+        }
+        return false;
+      };
+      if (remote?.id !== this.manifest.id || !remote.version || !newer(remote.version, this.manifest.version)) {
+        if (manual) new Notice(`Rikka is up to date (${this.manifest.version}).`);
+        return;
+      }
+      const js = (await requestUrl({ url: `${base}main.js${bust}` })).text;
+      const css = await requestUrl({ url: `${base}styles.css${bust}` }).then((r) => r.text, () => null);
+      // Sanity checks before touching the installed copy.
+      if (!js || js.length < 10000 || !js.includes("RikkaPlugin")) throw new Error("Downloaded update looks incomplete");
+      const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+      const adapter = this.app.vault.adapter;
+      await adapter.write(`${dir}/main.js`, js);
+      if (css) await adapter.write(`${dir}/styles.css`, css);
+      await adapter.write(`${dir}/manifest.json`, JSON.stringify(remote, null, 2));
+      new Notice(`Rikka updated to ${remote.version}.`);
+      const id = this.manifest.id;
+      const plugins = this.app.plugins;
+      window.setTimeout(async () => {
+        await plugins.disablePlugin(id);
+        await plugins.enablePlugin(id);
+      }, 300);
+    } catch (error) {
+      console.error("Rikka self-update failed", error);
+      if (manual) new Notice(`Couldn't check for updates: ${error?.message || error}`);
+    } finally {
+      this.selfUpdating = false;
+    }
   }
 
   // ---- Editor features -----------------------------------------------------
