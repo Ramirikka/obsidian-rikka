@@ -1767,9 +1767,19 @@ module.exports = class RikkaPlugin extends Plugin {
     this.selfUpdating = true;
     try {
       const { requestUrl } = require("obsidian");
-      const base = "https://github.com/Ramirikka/obsidian-rikka/releases/latest/download/";
-      const bust = `?t=${now}`;
-      const remote = (await requestUrl({ url: `${base}manifest.json${bust}` })).json;
+      // Ask GitHub for the latest release and its files. A release whose files
+      // haven't been attached yet (they arrive ~40s after publishing) is
+      // simply skipped and picked up on the next check.
+      const release = (await requestUrl({ url: "https://api.github.com/repos/Ramirikka/obsidian-rikka/releases/latest", headers: { Accept: "application/vnd.github+json" } })).json;
+      const asset = (name) => release?.assets?.find((a) => a.name === name)?.browser_download_url;
+      const manifestUrl = asset("manifest.json");
+      const jsUrl = asset("main.js");
+      if (!manifestUrl || !jsUrl) {
+        this.lastUpdateCheck = 0; // try again on the next trigger
+        if (manual) new Notice("A new Rikka release is still being prepared. Try again in a minute.");
+        return;
+      }
+      const remote = (await requestUrl({ url: manifestUrl })).json;
       const newer = (a, b) => {
         const pa = String(a).split(".").map(Number);
         const pb = String(b).split(".").map(Number);
@@ -1782,8 +1792,9 @@ module.exports = class RikkaPlugin extends Plugin {
         if (manual) new Notice(`Rikka is up to date (${this.manifest.version}).`);
         return;
       }
-      const js = (await requestUrl({ url: `${base}main.js${bust}` })).text;
-      const css = await requestUrl({ url: `${base}styles.css${bust}` }).then((r) => r.text, () => null);
+      const js = (await requestUrl({ url: jsUrl })).text;
+      const cssUrl = asset("styles.css");
+      const css = cssUrl ? await requestUrl({ url: cssUrl }).then((r) => r.text, () => null) : null;
       // Sanity checks before touching the installed copy.
       if (!js || js.length < 10000 || !js.includes("RikkaPlugin")) throw new Error("Downloaded update looks incomplete");
       const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
@@ -1799,7 +1810,8 @@ module.exports = class RikkaPlugin extends Plugin {
         await plugins.enablePlugin(id);
       }, 300);
     } catch (error) {
-      console.error("Rikka self-update failed", error);
+      this.lastUpdateCheck = 0; // a failed check (offline, GitHub hiccup) retries next time
+      console.warn("Rikka self-update check failed", error);
       if (manual) new Notice(`Couldn't check for updates: ${error?.message || error}`);
     } finally {
       this.selfUpdating = false;
