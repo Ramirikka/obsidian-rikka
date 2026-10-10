@@ -448,12 +448,14 @@ module.exports = class RikkaPlugin extends Plugin {
     this.registerDomEvent(document, "keydown", (event) => {
       const input = event.target;
       if (!(input instanceof HTMLInputElement) || !input.matches(".base-board-add-card-input")) return;
-      if (event.key === "Enter" || event.key === "Escape") {
-        if (event.key === "Enter") this.mobileDragClickSuppression = Date.now() + 1000;
-        // Let Base Board's own input handler commit/cancel first, then keep the
-        // key from reaching Obsidian's page-level shortcuts after it removes the input.
-        input.addEventListener("keydown", (keyEvent) => keyEvent.stopPropagation(), { once: true });
-      }
+      if (event.key !== "Enter") return;
+      // Base Board commits on both Enter and blur. Handling Enter here keeps
+      // the key from reaching Obsidian after Base Board removes its input;
+      // blur then commits through Base Board's existing, supported path.
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      this.mobileDragClickSuppression = Date.now() + 1200;
+      input.blur();
     }, true);
     this.registerDomEvent(document, "focusin", (event) => {
       const input = event.target;
