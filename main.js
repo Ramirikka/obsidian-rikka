@@ -1,4 +1,4 @@
-const { ItemView, Menu, Modal, Notice, Plugin, Setting, TFile, TFolder, setIcon } = require("obsidian");
+const { ItemView, Menu, Modal, Notice, Platform, Plugin, Setting, TFile, TFolder, setIcon } = require("obsidian");
 
 const VIEW_TYPE = "rikka-binder";
 const DEFAULT_DATA = { collapsed: {}, research: [], trash: [], collections: {}, templates: [], wordTarget: 0 };
@@ -308,7 +308,7 @@ class RikkaBinderView extends ItemView {
       icon.createEl("img", {
         cls: "rikka-scrivener-icon",
         attr: {
-          src: this.plugin.app.vault.adapter.getResourcePath(iconPath),
+          src: RIKKA_ICON_DATA[folderIcon] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
           alt: "",
           "aria-hidden": "true",
         },
@@ -346,7 +346,7 @@ class RikkaBinderView extends ItemView {
       icon.createEl("img", {
         cls: "rikka-scrivener-icon",
         attr: {
-          src: this.plugin.app.vault.adapter.getResourcePath(iconPath),
+          src: RIKKA_ICON_DATA["BinderText@2x@2x.png"] || this.plugin.app.vault.adapter.getResourcePath(iconPath),
           alt: "",
           "aria-hidden": "true",
         },
@@ -668,7 +668,13 @@ module.exports = class RikkaPlugin extends Plugin {
   }
 
   async openFile(file, newTab = false, split = false) {
-    // Reuse the leftmost main-workspace tab for ordinary binder navigation.
+    // On iPhone, the first root leaf can be the mobile sidebar itself. Opening
+    // a note there silently does nothing, so use the active content leaf.
+    if (Platform.isMobile && !newTab && !split) {
+      await this.app.workspace.getLeaf(false).openFile(file);
+      return;
+    }
+    // Reuse the leftmost main-workspace tab for ordinary desktop navigation.
     // Explicit tab and split commands leave the current document visible.
     let firstLeaf = null;
     this.app.workspace.iterateRootLeaves((candidate) => {
