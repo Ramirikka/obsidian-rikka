@@ -1551,6 +1551,12 @@ module.exports = class RikkaPlugin extends Plugin {
     this.newCardGuardUntil = 0;
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (Date.now() >= this.newCardGuardUntil || !(file instanceof TFile) || file.extension !== "md") return;
+      // Only files that are new cards: created in a folder that already holds
+      // cards of an open board. Other notes created meanwhile open normally.
+      const folder = file.parent?.path || "";
+      const isCardFolder = Array.from(document.querySelectorAll(".base-board-card[data-file-path]"))
+        .some((card) => (card.dataset.filePath || "").replace(/\/[^/]*$/, "") === folder);
+      if (!isCardFolder) return;
       this.newCardPaths.add(file.path);
       window.setTimeout(() => this.newCardPaths.delete(file.path), 3000);
     }));
