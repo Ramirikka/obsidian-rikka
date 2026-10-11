@@ -1101,12 +1101,12 @@ class RikkaQA {
       for (const title of ["مهمة جديدة 12", "Launch 🚀 v2", "What's next, really?"]) {
         input.value = title;
         enter(input);
-        await this.waitFor(() => this.file(`${cards}/${title}.md`), 3000);
+        await this.waitFor(() => this.file(`${cards}/${title.replace("?", "")}.md`), 3000);
         await this.wait(400);
       }
       this.check("Arabic title kept as-is", this.file(`${cards}/مهمة جديدة 12.md`));
       this.check("Emoji title kept as-is", this.file(`${cards}/Launch 🚀 v2.md`));
-      this.check("Punctuation title kept", this.file(`${cards}/What's next, really?.md`) || this.file(`${cards}/What's next, really — .md`), "missing");
+      this.check("'?' (not allowed in file names) is dropped cleanly", this.file(`${cards}/What's next, really.md`), this.file(cards).children.map((f) => f.name).filter((n) => n.startsWith("What")).join(", ") || "missing");
       closeInput(column("Doing")?.querySelector(".rikka-board-card-input") || input);
       await this.wait(400);
     });
@@ -1734,8 +1734,10 @@ module.exports = class RikkaPlugin extends Plugin {
     const folder = config?.newItemFolder
       || (filterFolder && this.app.vault.getAbstractFileByPath(filterFolder) instanceof TFolder ? filterFolder : "")
       || baseFile.parent?.path || "";
-    const safeTitle = title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, " — ").replace(/\s+/g, " ").trim().slice(0, 160);
+    // Characters files can't hold: ":" and "/" become " - ", the rest are dropped.
+    const safeTitle = title.replace(/[\\/:]/g, " - ").replace(/[*?"<>|\u0000-\u001f]/g, "").replace(/[#^\[\]]/g, "").replace(/\s+/g, " ").replace(/^[.\s]+|[.\s]+$/g, "").slice(0, 160);
     if (!safeTitle) throw new Error("Enter a title for the card.");
+    if (!config?.newCardsToTop) await this.ensureColumnOrderKeys(column);
     const order = this.boardOrderKey(column, !!config?.newCardsToTop);
     const properties = { ...(config?.newItemProperties || {}), [groupProperty]: column.dataset.columnName, kanban_order: order };
     let path = `${folder ? folder + "/" : ""}${safeTitle}.md`;
@@ -1747,6 +1749,24 @@ module.exports = class RikkaPlugin extends Plugin {
     await this.app.vault.create(path, `---\n${stringifyYaml(properties).trimEnd()}\n---\n\n`);
     this.noticeIfHiddenByFilter(column, path, safeTitle);
     return path;
+  }
+
+  // Base Board always shows cards without a kanban_order last. Before adding a
+  // card to the bottom, give those cards keys in their current on-screen order
+  // (what Base Board itself does on the first drag), so "bottom" means bottom.
+  async ensureColumnOrderKeys(column) {
+    const cards = Array.from(column?.querySelectorAll?.(".base-board-card[data-file-path]") || []);
+    const files = cards.map((c) => this.app.vault.getAbstractFileByPath(c.dataset.filePath)).filter((f) => f instanceof TFile);
+    const order = (f) => this.app.metadataCache.getFileCache(f)?.frontmatter?.kanban_order;
+    const missing = files.filter((f) => order(f) === undefined || order(f) === null || order(f) === "");
+    if (!missing.length || files.some((f) => typeof order(f) === "number")) return;
+    let last = files.map(order).filter((k) => typeof k === "string" && k).sort().pop() || null;
+    for (const file of missing) {
+      last = last ? last + "V" : "a0";
+      const key = last;
+      await this.app.fileManager.processFrontMatter(file, (fm) => { fm.kanban_order = key; });
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
   }
 
   // Order key for a card placed at the top or bottom of a column, using Base
@@ -2034,9 +2054,9 @@ module.exports = class RikkaPlugin extends Plugin {
     }, true);
 
     const attachTouchDrag = () => {
-      for (const leaf of this.app.workspace.getLeavesOfType("base-board")) {
-        const manager = leaf.view?.dragDropManager;
+      for (const leaf of this.app.workspace.getLeavesOfType("bases")) {
         const board = leaf.view?.containerEl?.querySelector(".base-board-board");
+        const manager = board && this.findBoardDragManager(leaf, board);
         if (!manager || !board || manager.__rikkaTouchBoard === board) continue;
         manager.__rikkaTouchCleanup?.();
         let state = null;
@@ -2163,6 +2183,35 @@ module.exports = class RikkaPlugin extends Plugin {
     this.mobileBoardObserver.observe(this.app.workspace.containerEl, { childList: true, subtree: true });
     this.register(() => this.mobileBoardObserver?.disconnect());
     attachTouchDrag();
+  }
+
+  // Base Board runs inside Obsidian's "bases" view. Find its KanbanView's
+  // drag manager by a shallow search of the leaf's view (no private names).
+  findBoardDragManager(leaf, board) {
+    if (leaf.__rikkaDragManager && leaf.__rikkaDragManager.boardEl === board) return leaf.__rikkaDragManager;
+    const seen = new Set();
+    let queue = [leaf.view];
+    for (let depth = 0; depth < 4 && queue.length; depth++) {
+      const next = [];
+      for (const obj of queue) {
+        if (!obj || typeof obj !== "object" || seen.has(obj) || obj instanceof Node || obj === this.app) continue;
+        seen.add(obj);
+        const manager = obj.dragDropManager;
+        if (manager && typeof manager.handleCardDrop === "function" && manager.boardEl === board) {
+          leaf.__rikkaDragManager = manager;
+          return manager;
+        }
+        for (const key of Object.keys(obj)) {
+          if (key === "app" || key === "plugin" || key === "workspace") continue;
+          let value;
+          try { value = obj[key]; } catch (e) { continue; }
+          if (value && typeof value === "object" && !(value instanceof Node)) next.push(value);
+        }
+        if (next.length > 2000) break;
+      }
+      queue = next;
+    }
+    return null;
   }
 
   // Phone: a compact row of column chips ("To do 12") above the stacked board.
