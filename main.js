@@ -1024,9 +1024,11 @@ class RikkaQA {
     await this.step("Slash menu opens at a line start and converts in one undo step", async () => {
       const path = `${this.sandbox}/Editor test.md`;
       await this.app.vault.create(path, "Hello\n");
-      const leaf = this.app.workspace.getLeaf(false);
+      const leaf = this.app.workspace.getLeaf(Platform.isMobile ? false : "tab");
       await leaf.openFile(this.file(path), { active: true, state: { mode: "source" } });
-      const editor = await this.waitFor(() => leaf.view?.editor);
+      await this.waitFor(() => leaf.view?.file?.path === path && leaf.view?.editor, 4000);
+      if (leaf.view?.file?.path !== path) throw new Error(`editor opened ${leaf.view?.file?.path}`);
+      const editor = leaf.view.editor;
       editor.focus();
       editor.setCursor({ line: 1, ch: 0 });
       editor.replaceRange("/hea", { line: 1, ch: 0 });
@@ -1306,6 +1308,17 @@ module.exports = class RikkaPlugin extends Plugin {
     enhance();
   }
 
+  // Scroll only the column's own card list so the input is visible — never the
+  // board sideways or the page (scrollIntoView would move every ancestor).
+  revealInColumn(el) {
+    const list = el.closest(".base-board-cards");
+    if (!list) return;
+    const box = el.getBoundingClientRect();
+    const view = list.getBoundingClientRect();
+    if (box.bottom > view.bottom) list.scrollTop += box.bottom - view.bottom + 8;
+    else if (box.top < view.top) list.scrollTop -= view.top - box.top + 8;
+  }
+
   // Mobile: a composer bar pinned just above the keyboard. It lives outside the
   // board, so Base Board redrawing the column can't move or remove it, the
   // keyboard never covers it, and nothing on the board scrolls or jumps.
@@ -1443,7 +1456,7 @@ module.exports = class RikkaPlugin extends Plugin {
             if (!liveCards) { close(); return; }
             liveCards.appendChild(wrapper);
             input.focus({ preventScroll: true });
-            wrapper.scrollIntoView({ block: "nearest", inline: "nearest" });
+            this.revealInColumn(wrapper);
           };
           reattach();
           window.setTimeout(reattach, 250);
@@ -1479,7 +1492,7 @@ module.exports = class RikkaPlugin extends Plugin {
       }, 0);
     });
     input.focus({ preventScroll: true });
-    wrapper.scrollIntoView({ block: "nearest", inline: "nearest" });
+    this.revealInColumn(wrapper);
   }
 
   async createBoardCard(column, title, knownInfo = null) {
