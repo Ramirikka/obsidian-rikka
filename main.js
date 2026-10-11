@@ -773,21 +773,32 @@ class RikkaQA {
   async setup(mode) {
     const root = this.plugin.activeProject.path;
     this.sandbox = `${root}/_Rikka QA ${mode}`;
-    if (this.file(this.sandbox)) await this.app.fileManager.trashFile(this.file(this.sandbox));
+    // Clear leftovers from any earlier run (either mode).
+    for (const old of [`${root}/_Rikka QA desktop`, `${root}/_Rikka QA mobile`]) {
+      if (this.file(old)) await this.app.fileManager.trashFile(this.file(old));
+    }
     await this.app.vault.createFolder(this.sandbox);
     await this.plugin.activateView();
     await this.waitFor(() => this.view()?.containerEl.querySelector(".rikka-section"));
   }
   async teardown() {
+    // Save and close every tab showing a test file, then let pending saves
+    // finish, so nothing recreates the sandbox after it is trashed.
+    const isTest = (path) => path.startsWith(this.sandbox) || path.endsWith("/Mobile Context Test.md");
     for (const leaf of this.app.workspace.getLeavesOfType("bases").concat(this.app.workspace.getLeavesOfType("markdown"))) {
       const path = leaf.view?.file?.path || "";
-      if (path.startsWith(this.sandbox)) leaf.detach();
+      if (!isTest(path)) continue;
+      try { await leaf.view?.save?.(); } catch (error) { /* ignore */ }
+      leaf.detach();
     }
+    await this.wait(2500);
     const research = (p) => p.startsWith(this.sandbox) || p.includes("Mobile Context Test");
     this.plugin.data.research = this.plugin.data.research.filter((p) => !research(p));
     const stray = this.file(`${this.plugin.activeProject.path}/Mobile Context Test.md`);
     if (stray) await this.app.fileManager.trashFile(stray);
     if (this.file(this.sandbox)) await this.app.fileManager.trashFile(this.file(this.sandbox));
+    await this.wait(2500);
+    if (this.file(this.sandbox)) await this.app.fileManager.trashFile(this.file(this.sandbox)); // late save safety net
     this.plugin.data.context = { section: "draft", folder: "" };
     await this.plugin.saveState();
   }
@@ -1055,6 +1066,8 @@ class RikkaQA {
       this.plugin.slashSuggest?.trigger?.(editor, this.file(path), true); // try hard to open it
       await this.wait(400);
       this.check("URLs do not open the slash menu", !this.q(".suggestion-container .rikka-slash-item"));
+      this.plugin.slashSuggest?.close?.();
+      await leaf.view?.save?.();
       leaf.detach();
     });
   }
