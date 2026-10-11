@@ -1048,8 +1048,11 @@ class RikkaQA {
       this.check("Turned into heading", editor.getLine(1).startsWith("## "), editor.getLine(1));
       editor.undo();
       this.check("One undo restores '/hea'", editor.getLine(1) === "/hea", editor.getLine(1));
+      this.plugin.slashSuggest?.close?.();
+      await this.wait(200);
       editor.setValue("See https://example.com/foo/bar");
       editor.setCursor({ line: 0, ch: editor.getLine(0).length });
+      this.plugin.slashSuggest?.trigger?.(editor, this.file(path), true); // try hard to open it
       await this.wait(400);
       this.check("URLs do not open the slash menu", !this.q(".suggestion-container .rikka-slash-item"));
       leaf.detach();
