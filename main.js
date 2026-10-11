@@ -840,6 +840,7 @@ class RikkaQA {
       this.tap(row.querySelector(".rikka-row-title"));
       await this.waitFor(() => this.plugin.data.context.folder === folder);
       this.check("Tapping folder name makes it current", this.plugin.data.context.folder === folder, JSON.stringify(this.plugin.data.context));
+      await this.waitFor(() => (v.containerEl.querySelector(".rikka-location-path")?.textContent || "").endsWith("/ Competitors"), 1500);
       this.check("Location bar shows nested path", (v.containerEl.querySelector(".rikka-location-path")?.textContent || "").endsWith("/ Competitors"), v.containerEl.querySelector(".rikka-location-path")?.textContent);
       this.tap(v.containerEl.querySelector('[aria-label="New document here"]'));
       const dtitle = await this.submitName("Pricing");
@@ -1030,6 +1031,9 @@ class RikkaQA {
       editor.setCursor({ line: 1, ch: 0 });
       editor.replaceRange("/hea", { line: 1, ch: 0 });
       editor.setCursor({ line: 1, ch: 4 });
+      // Programmatic edits don't fire the typing event EditorSuggest listens
+      // to; trigger it the way a keystroke would.
+      this.plugin.slashSuggest?.trigger?.(editor, this.file(path), true);
       const pop = await this.waitFor(() => this.q(".suggestion-container .rikka-slash-item"), 2500);
       this.check("Slash menu appears", pop, "no .rikka-slash-item");
       if (pop) {
@@ -1053,11 +1057,15 @@ class RikkaQA {
   async layoutChecks() {
     await this.step("Touch targets and toolbar", async () => {
       const v = this.view();
+      // On mobile the Binder lives in a drawer; open it before measuring.
+      this.app.workspace.leftSplit?.expand?.();
+      await this.plugin.activateView();
+      await this.wait(600);
       const buttons = Array.from(v.containerEl.querySelectorAll(".rikka-toolbar .rikka-icon-button"));
       const small = buttons.filter((b) => { const r = b.getBoundingClientRect(); return r.width < 40 || r.height < 40; });
       this.check("Toolbar buttons ≥ 40px", !small.length, small.map((b) => b.getAttribute("aria-label")).join(", "));
       this.check("Toolbar has at most 3 actions", buttons.length <= 3, String(buttons.length));
-      const rows = Array.from(v.containerEl.querySelectorAll(".rikka-row")).slice(0, 10);
+      const rows = Array.from(v.containerEl.querySelectorAll(".rikka-row")).filter((r) => r.offsetParent).slice(0, 10);
       const shortRows = rows.filter((r) => r.getBoundingClientRect().height < 38);
       this.check("Binder rows ≥ 38px tall", !shortRows.length, `${shortRows.length} short rows`);
       const overflow = v.containerEl.scrollWidth > v.containerEl.clientWidth + 2;
@@ -1478,7 +1486,14 @@ module.exports = class RikkaPlugin extends Plugin {
     const info = knownInfo || await this.getBoardInfo(column);
     if (!info) throw new Error("Open the board as a page before adding an item.");
     const { baseFile, config, groupProperty } = info;
-    const folder = config?.newItemFolder || baseFile.parent?.path || "";
+    // Put the card where the board will actually show it: the board's
+    // "new item folder" if set, else the folder its filter looks in
+    // (file.inFolder("…")), else next to the .base file.
+    const baseText = info.raw || "";
+    const filterFolder = (baseText.match(/file\.inFolder\(\s*["']([^"']+)["']\s*\)/) || [])[1];
+    const folder = config?.newItemFolder
+      || (filterFolder && this.app.vault.getAbstractFileByPath(filterFolder) instanceof TFolder ? filterFolder : "")
+      || baseFile.parent?.path || "";
     const safeTitle = title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, " — ").replace(/\s+/g, " ").trim().slice(0, 160);
     if (!safeTitle) throw new Error("Enter a title for the item.");
     const orders = Array.from(column.querySelectorAll(".base-board-card[data-file-path]")).map((card) => {
@@ -1613,9 +1628,10 @@ module.exports = class RikkaPlugin extends Plugin {
     const statePath = boardLeaf?.view?.getState?.()?.file;
     const baseFile = boardLeaf?.view?.file || (statePath && this.app.vault.getAbstractFileByPath(statePath));
     if (!(baseFile instanceof TFile) || baseFile.extension !== "base") return null;
-    const definition = parseYaml(await this.app.vault.read(baseFile)) || {};
+    const raw = await this.app.vault.read(baseFile);
+    const definition = parseYaml(raw) || {};
     const config = (definition.views || []).find((view) => view.type === "base-board");
-    return { leaf: boardLeaf, baseFile, config, groupProperty: (config?.groupBy?.property || "status").replace(/^note\./, "") };
+    return { leaf: boardLeaf, baseFile, config, raw, groupProperty: (config?.groupBy?.property || "status").replace(/^note\./, "") };
   }
 
   showCardMenu(card, point) {
@@ -2430,7 +2446,8 @@ module.exports = class RikkaPlugin extends Plugin {
   // ---- Editor features -----------------------------------------------------
 
   installEditorFeatures() {
-    this.registerEditorSuggest(new RikkaSlashSuggest(this));
+    this.slashSuggest = new RikkaSlashSuggest(this);
+    this.registerEditorSuggest(this.slashSuggest);
     this.registerEditorSuggest(new RikkaMentionSuggest(this));
 
     // Paste a URL over selected text => [text](url). Only when the selection is
@@ -2961,6 +2978,7 @@ module.exports = class RikkaPlugin extends Plugin {
       if (section.startsWith("collection:")) this.data.collapsed[section] = false;
       else this.data.collapsed[`section:${section}`] = false;
     }
+    this.getView()?.updateContextHighlight(); // instant feedback, before the re-render
     void this.saveState();
   }
 
