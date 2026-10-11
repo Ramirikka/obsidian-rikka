@@ -1047,7 +1047,13 @@ class RikkaQA {
 
   // kanban.creation / persistence / navigation / edge-cases
   async kanbanAudit(mode) {
-    const leaf = this.app.workspace.getLeavesOfType("bases").find((l) => l.view?.file?.path === `${this.sandbox}/QA Board.base`);
+    const baseFile = this.file(`${this.sandbox}/QA Board.base`);
+    let leaf = this.app.workspace.getLeavesOfType("bases").find((l) => l.view?.file?.path === baseFile?.path);
+    if (!leaf && baseFile) {
+      leaf = this.app.workspace.getLeaf(Platform.isMobile ? false : "tab");
+      await leaf.openFile(baseFile, { active: true });
+      await this.waitFor(() => leaf.view?.containerEl?.querySelector(".base-board-board .base-board-card"), 6000);
+    }
     const boardEl = () => leaf?.view?.containerEl?.querySelector(".base-board-board");
     if (!boardEl()) { this.check("kanban: board available", false, "QA board not open"); return; }
     const cards = `${this.sandbox}/Cards`;
@@ -1175,6 +1181,8 @@ class RikkaQA {
         this.check("Tapping a chip brings its column to the top", Math.abs(offset) < 60 || boardEl().scrollTop >= boardEl().scrollHeight - boardEl().clientHeight - 2, `offset ${Math.round(offset)}`);
         this.check("Chips fit on screen", leaf.view.containerEl.querySelector(".rikka-column-chips").getBoundingClientRect().height < 60);
       });
+    }
+    if (mode === "mobile") {
       await this.step("kanban.mobile: a swipe that starts on a card does not open or move it", async () => {
         const card = Array.from(boardEl().querySelectorAll(".base-board-card")).find((c) => c.dataset.filePath === `${cards}/Card A.md`);
         const r = card.getBoundingClientRect();
@@ -1190,6 +1198,9 @@ class RikkaQA {
         this.check("Card stays in its column", this.app.metadataCache.getFileCache(this.file(`${cards}/Card A.md`))?.frontmatter?.status === "To Do");
       });
       await this.step("kanban.mobile: long-press + drag moves exactly once and does not open", async () => {
+        boardEl().scrollLeft = Math.max(0, column("Doing").offsetLeft - 10);
+        column("Doing").scrollIntoView({ block: "start" });
+        await this.wait(200);
         const card = Array.from(boardEl().querySelectorAll(".base-board-card")).find((c) => c.dataset.filePath === `${cards}/Card C.md`);
         const target = column("Done").querySelector(".base-board-cards");
         const r = card.getBoundingClientRect();
