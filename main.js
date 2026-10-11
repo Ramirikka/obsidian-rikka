@@ -813,6 +813,7 @@ class RikkaQA {
       await this.fileFlows(mode);
       await this.boardFlows(mode);
       await this.editorFlows(mode);
+      await this.kanbanAudit(mode);
       if (mode === "mobile") await this.layoutChecks();
     } finally {
       await this.teardown();
@@ -1040,6 +1041,174 @@ class RikkaQA {
         const cardsBox = boardEl().querySelector(".base-board-cards");
         this.check("Columns are not inner-scroll boxes", getComputedStyle(cardsBox).overflowY === "visible", getComputedStyle(cardsBox).overflowY);
         this.check("No horizontal overflow", boardEl().scrollWidth <= boardEl().clientWidth + 2, `${boardEl().scrollWidth} > ${boardEl().clientWidth}`);
+      });
+    }
+  }
+
+  // kanban.creation / persistence / navigation / edge-cases
+  async kanbanAudit(mode) {
+    const leaf = this.app.workspace.getLeavesOfType("bases").find((l) => l.view?.file?.path === `${this.sandbox}/QA Board.base`);
+    const boardEl = () => leaf?.view?.containerEl?.querySelector(".base-board-board");
+    if (!boardEl()) { this.check("kanban: board available", false, "QA board not open"); return; }
+    const cards = `${this.sandbox}/Cards`;
+    const column = (name) => Array.from(boardEl().querySelectorAll(".base-board-column")).find((c) => c.dataset.columnName === name);
+    const count = (prefix) => this.file(cards).children.filter((f) => f.name.startsWith(prefix)).length;
+    const openInput = async (name) => {
+      this.tap(column(name).querySelector(".base-board-column-add-card, .base-board-column-add-card-footer-button"));
+      return mode === "mobile"
+        ? this.waitFor(() => this.q(".rikka-card-composer-input"))
+        : this.waitFor(() => column(name)?.querySelector(".rikka-board-card-input"));
+    };
+    const closeInput = (input) => {
+      if (mode === "mobile") this.tap(this.q(".rikka-card-composer-done"));
+      else input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    };
+    const enter = (input) => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+
+    await this.step("kanban.creation: whitespace-only title is rejected", async () => {
+      const input = await openInput("To Do");
+      const before = this.file(cards).children.length;
+      input.value = "     ";
+      enter(input);
+      await this.wait(600);
+      this.check("No card created for '     '", this.file(cards).children.length === before, `${before} → ${this.file(cards).children.length}`);
+      input.value = "";
+      closeInput(input);
+      await this.wait(300);
+    });
+
+    await this.step("kanban.creation: rapid Enter creates exactly one card", async () => {
+      const input = await openInput("To Do");
+      input.value = "Rapid card";
+      enter(input); enter(input); enter(input);
+      if (mode === "mobile") this.tap(this.q(".rikka-card-composer-done"));
+      await this.waitFor(() => this.file(`${cards}/Rapid card.md`));
+      await this.wait(900);
+      this.check("Exactly one 'Rapid card'", count("Rapid card") === 1, `${count("Rapid card")} files`);
+      if (mode !== "mobile") closeInput(column("To Do")?.querySelector(".rikka-board-card-input") || input);
+      await this.waitFor(() => !this.q(".rikka-card-composer"), 1500);
+      this.check("Nothing opened after rapid entry", leaf.view?.file?.path === `${this.sandbox}/QA Board.base`, leaf.view?.file?.path);
+    });
+
+    await this.step("kanban.creation: Arabic / emoji / punctuation titles", async () => {
+      const input = await openInput("Doing");
+      for (const title of ["مهمة جديدة 12", "Launch 🚀 v2", "What's next, really?"]) {
+        input.value = title;
+        enter(input);
+        await this.waitFor(() => this.file(`${cards}/${title}.md`), 3000);
+        await this.wait(400);
+      }
+      this.check("Arabic title kept as-is", this.file(`${cards}/مهمة جديدة 12.md`));
+      this.check("Emoji title kept as-is", this.file(`${cards}/Launch 🚀 v2.md`));
+      this.check("Punctuation title kept", this.file(`${cards}/What's next, really?.md`) || this.file(`${cards}/What's next, really — .md`), "missing");
+      closeInput(column("Doing")?.querySelector(".rikka-board-card-input") || input);
+      await this.wait(400);
+    });
+
+    await this.step("kanban.persistence: new cards go to the bottom with a stable order key", async () => {
+      await this.wait(500);
+      const doing = column("Doing");
+      const paths = Array.from(doing.querySelectorAll(".base-board-card[data-file-path]")).map((c) => c.dataset.filePath);
+      const last = paths[paths.length - 1] || "";
+      this.check("Last added card is last in its column", /What's next/.test(last), paths.map((p) => p.split("/").pop()).join(", "));
+      const order = (p) => this.app.metadataCache.getFileCache(this.file(p))?.frontmatter?.kanban_order;
+      this.check("Order key saved in the note", typeof order(`${cards}/Launch 🚀 v2.md`) === "string", JSON.stringify(order(`${cards}/Launch 🚀 v2.md`)));
+      const topKey = this.plugin.boardOrderKey(doing, true);
+      const keys = paths.map(order).filter((k) => typeof k === "string").sort();
+      this.check("'Top' key sorts before every card", keys.length && topKey < keys[0], `${topKey} vs ${keys[0]}`);
+    });
+
+    await this.step("kanban.drafts: unfinished text survives closing the input", async () => {
+      let input = await openInput("Done");
+      input.value = "Half-typed idea";
+      if (mode === "mobile") {
+        this.plugin.composerCleanup?.(); // what leaving the board does
+      } else {
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      }
+      await this.wait(300);
+      this.check("No card created from the draft", !this.file(`${cards}/Half-typed idea.md`));
+      input = await openInput("Done");
+      this.check("Draft restored when reopening", input?.value === "Half-typed idea", input?.value);
+      input.value = "";
+      closeInput(input);
+      await this.wait(300);
+    });
+
+    await this.step("kanban.drag-alternative: Move to column updates the note and keeps one card", async () => {
+      const file = this.file(`${cards}/Card B.md`);
+      const info = await this.plugin.getBoardInfo(boardEl());
+      await this.plugin.moveCardToColumn(file, boardEl(), "Done", info);
+      await this.waitFor(() => column("Done") && Array.from(column("Done").querySelectorAll(".base-board-card")).some((c) => c.dataset.filePath === file.path), 3000);
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      this.check("Note's status changed to Done", fm?.status === "Done", JSON.stringify(fm));
+      const where = Array.from(boardEl().querySelectorAll(".base-board-card")).filter((c) => c.dataset.filePath === file.path);
+      this.check("Exactly one card on the board", where.length === 1, `${where.length}`);
+      this.check("Card shows in Done", where[0]?.closest(".base-board-column")?.dataset.columnName === "Done");
+      let failed = false;
+      try { await this.plugin.moveCardToColumn(file, boardEl(), "No such column", info); } catch (e) { failed = true; }
+      this.check("Missing destination is refused, not dumped somewhere", failed && this.app.metadataCache.getFileCache(file)?.frontmatter?.status === "Done");
+    });
+
+    await this.step("kanban.persistence: reopening the board keeps cards and order", async () => {
+      const before = Array.from(column("Doing").querySelectorAll(".base-board-card[data-file-path]")).map((c) => c.dataset.filePath).join("|");
+      await leaf.openFile(this.file(`${cards}/Card A.md`));
+      await this.wait(300);
+      await leaf.openFile(this.file(`${this.sandbox}/QA Board.base`));
+      await this.waitFor(() => column("Doing")?.querySelector(".base-board-card"), 5000);
+      await this.wait(400);
+      const after = Array.from(column("Doing").querySelectorAll(".base-board-card[data-file-path]")).map((c) => c.dataset.filePath).join("|");
+      this.check("Same cards in the same order", before === after, `${before} → ${after}`);
+    });
+
+    if (mode === "mobile" && document.body.hasClass("is-phone")) {
+      await this.step("kanban.mobile: column chips", async () => {
+        const chips = await this.waitFor(() => leaf.view.containerEl.querySelector(".rikka-column-chips .rikka-column-chip"), 2000);
+        this.check("Column chips shown", chips);
+        const chip = Array.from(leaf.view.containerEl.querySelectorAll(".rikka-column-chip")).find((c) => c.dataset.column === "Done");
+        const n = column("Done").querySelectorAll(".base-board-card[data-file-path]").length;
+        this.check("Chip count matches cards", chip?.querySelector(".rikka-column-chip-count")?.textContent === String(n), `${chip?.textContent} vs ${n}`);
+        boardEl().scrollTop = 0;
+        chip?.click();
+        await this.wait(700);
+        const offset = column("Done").getBoundingClientRect().top - boardEl().getBoundingClientRect().top;
+        this.check("Tapping a chip brings its column to the top", Math.abs(offset) < 60 || boardEl().scrollTop >= boardEl().scrollHeight - boardEl().clientHeight - 2, `offset ${Math.round(offset)}`);
+        this.check("Chips fit on screen", leaf.view.containerEl.querySelector(".rikka-column-chips").getBoundingClientRect().height < 60);
+      });
+      await this.step("kanban.mobile: a swipe that starts on a card does not open or move it", async () => {
+        const card = Array.from(boardEl().querySelectorAll(".base-board-card")).find((c) => c.dataset.filePath === `${cards}/Card A.md`);
+        const r = card.getBoundingClientRect();
+        const t = (y) => new Touch({ identifier: 7, target: card, clientX: r.left + 20, clientY: y });
+        card.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [t(r.top + 10)], changedTouches: [t(r.top + 10)] }));
+        card.dispatchEvent(new TouchEvent("touchmove", { bubbles: true, cancelable: true, touches: [t(r.top + 60)], changedTouches: [t(r.top + 60)] }));
+        await this.wait(450); // past the long-press time
+        card.dispatchEvent(new TouchEvent("touchend", { bubbles: true, cancelable: true, touches: [], changedTouches: [t(r.top + 60)] }));
+        await this.wait(300);
+        this.check("Card not picked up", !card.hasClass("base-board-card--dragging") && !boardEl().querySelector(".base-board-card-placeholder"));
+        this.check("Card not opened", leaf.view?.file?.path === `${this.sandbox}/QA Board.base`);
+        this.check("No menu opened", !document.querySelector(".menu"));
+        this.check("Card stays in its column", this.app.metadataCache.getFileCache(this.file(`${cards}/Card A.md`))?.frontmatter?.status === "To Do");
+      });
+      await this.step("kanban.mobile: long-press + drag moves exactly once and does not open", async () => {
+        const card = Array.from(boardEl().querySelectorAll(".base-board-card")).find((c) => c.dataset.filePath === `${cards}/Card C.md`);
+        const target = column("Done").querySelector(".base-board-cards");
+        const r = card.getBoundingClientRect();
+        const tr = target.getBoundingClientRect();
+        const t = (x, y) => new Touch({ identifier: 9, target: card, clientX: x, clientY: y });
+        const start = t(r.left + 30, r.top + 10);
+        card.dispatchEvent(new TouchEvent("touchstart", { bubbles: true, cancelable: true, touches: [start], changedTouches: [start] }));
+        await this.wait(450);
+        this.check("Long-press picks the card up", card.hasClass("base-board-card--dragging"));
+        const end = t(tr.left + 30, tr.bottom - 10);
+        card.dispatchEvent(new TouchEvent("touchmove", { bubbles: true, cancelable: true, touches: [end], changedTouches: [end] }));
+        await this.wait(100);
+        card.dispatchEvent(new TouchEvent("touchend", { bubbles: true, cancelable: true, touches: [], changedTouches: [end] }));
+        card.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); // the click iOS sends after touchend
+        await this.waitFor(() => this.app.metadataCache.getFileCache(this.file(`${cards}/Card C.md`))?.frontmatter?.status === "Done", 3000);
+        this.check("Note moved to Done", this.app.metadataCache.getFileCache(this.file(`${cards}/Card C.md`))?.frontmatter?.status === "Done");
+        await this.wait(400);
+        this.check("Exactly one Card C on the board", Array.from(boardEl().querySelectorAll(".base-board-card")).filter((c) => c.dataset.filePath === `${cards}/Card C.md`).length === 1);
+        this.check("Drop did not open the card", leaf.view?.file?.path === `${this.sandbox}/QA Board.base`, leaf.view?.file?.path);
       });
     }
   }
@@ -1311,13 +1480,15 @@ module.exports = class RikkaPlugin extends Plugin {
 
   installBoardCreationSupport() {
     const enhance = () => {
+      // Long titles are clamped to 3 lines; the full title shows on hover.
+      if (!Platform.isMobile) document.querySelectorAll(".base-board-card-title span:not([title])").forEach((span) => { span.title = span.textContent || ""; });
       document.querySelectorAll(".base-board-column").forEach((column) => {
         if (column.querySelector(".base-board-column-add-card-footer")) return;
         const footer = column.createDiv({ cls: "base-board-column-add-card-footer" });
         footer.createEl("button", {
           cls: "base-board-column-add-card-footer-button",
-          text: "+ Add new item",
-          attr: { type: "button", "aria-label": `Add new item to ${column.dataset.columnName || "column"}` }
+          text: "+ Add card",
+          attr: { type: "button", "aria-label": `Add card to ${column.dataset.columnName || "column"}` }
         });
       });
     };
@@ -1357,7 +1528,7 @@ module.exports = class RikkaPlugin extends Plugin {
     const columnName = column.dataset.columnName || "";
     const board = column.closest(".base-board-board");
     const info = await this.getBoardInfo(column);
-    if (!info) { new Notice("Open the board as a page before adding an item."); return; }
+    if (!info) { new Notice("Open the board as a page before adding a card."); return; }
     const liveColumn = () => {
       if (column.isConnected) return column;
       const fresh = Array.from(board?.querySelectorAll(".base-board-column") || []).find((el) => el.dataset.columnName === columnName);
@@ -1390,26 +1561,35 @@ module.exports = class RikkaPlugin extends Plugin {
     vv?.addEventListener("resize", place);
     vv?.addEventListener("scroll", place);
 
+    // Unfinished text survives leaving the board (Back, switching notes, Esc)
+    // and is waiting in the bar next time it opens for this column.
+    this.cardDrafts ||= new Map();
+    const draftKey = `${info.baseFile.path}::${columnName}`;
+    if (this.cardDrafts.get(draftKey)) input.value = this.cardDrafts.get(draftKey);
     let busy = false;
     let closed = false;
     let offLayout = null;
     const close = () => {
       if (closed) return;
       closed = true;
+      if (input.value.trim()) this.cardDrafts.set(draftKey, input.value); else this.cardDrafts.delete(draftKey);
       if (offLayout) this.app.workspace.offref(offLayout);
       vv?.removeEventListener("resize", place);
       vv?.removeEventListener("scroll", place);
       input.blur();
       bar.remove();
     };
+    let inflight = null;
     const add = async () => {
+      if (busy) return inflight; // Return + Done at once: wait, never duplicate
       const title = input.value.trim();
-      if (!title || busy) return false;
+      if (!title) return false;
       busy = true;
+      inflight = (async () => {
       this.armNewCardGuard();
       try {
         await this.createBoardCard(liveColumn(), title, info);
-        input.value = "";
+        if (input.value.trim() === title) input.value = ""; // keep anything typed meanwhile
         status.setText(" · added");
         window.setTimeout(() => status.setText(""), 1200);
         return true;
@@ -1419,6 +1599,8 @@ module.exports = class RikkaPlugin extends Plugin {
       } finally {
         busy = false;
       }
+      })();
+      return inflight;
     };
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.isComposing) {
@@ -1433,7 +1615,8 @@ module.exports = class RikkaPlugin extends Plugin {
     // Done: add what's typed (if anything), then close.
     done.addEventListener("pointerdown", (event) => event.preventDefault()); // keep focus until we're done
     done.addEventListener("click", async () => {
-      if (input.value.trim()) await add();
+      if (busy) await inflight;
+      if (input.value.trim() && !(await add())) return; // keep the bar if adding failed
       close();
     });
     // Leaving the board (back, switching notes) closes the bar.
@@ -1452,14 +1635,18 @@ module.exports = class RikkaPlugin extends Plugin {
     const wrapper = cards.createDiv({ cls: "base-board-add-card-input-wrapper rikka-board-input-wrapper" });
     const input = wrapper.createEl("input", {
       cls: "base-board-add-card-input rikka-board-card-input",
-      attr: { type: "text", placeholder: "New item", "aria-label": "New card title", inputmode: "text", autocapitalize: "sentences", autocomplete: "off" }
+      attr: { type: "text", placeholder: "Card title", "aria-label": "New card title", inputmode: "text", autocapitalize: "sentences", autocomplete: "off" }
     });
+    this.cardDrafts ||= new Map();
+    const draftKey = `${column.closest(".base-board-board") ? (this.app.workspace.getActiveFile()?.path || "") : ""}::${column.dataset.columnName || ""}`;
+    if (this.cardDrafts.get(draftKey)) input.value = this.cardDrafts.get(draftKey);
     let busy = false;
     let closed = false;
     let lastCommit = 0;
     const close = () => {
       if (closed) return;
       closed = true;
+      if (input.value.trim()) this.cardDrafts.set(draftKey, input.value); else this.cardDrafts.delete(draftKey);
       wrapper.remove();
     };
     // keepOpen: Enter adds the card and leaves the field ready for the next one.
@@ -1471,7 +1658,7 @@ module.exports = class RikkaPlugin extends Plugin {
       try {
         await this.createBoardCard(column, title);
         lastCommit = Date.now();
-        input.value = "";
+        if (input.value.trim() === title) input.value = "";
         if (keepOpen && !closed) {
           // Base Board may redraw the column after the file appears; re-attach
           // the input to the current column so rapid entry keeps working.
@@ -1493,7 +1680,7 @@ module.exports = class RikkaPlugin extends Plugin {
           close();
         }
       } catch (error) {
-        new Notice(`Could not add item: ${error?.message || error}`);
+        new Notice(`Could not add card: ${error?.message || error}`);
         if (!closed) input.focus();
       } finally {
         busy = false;
@@ -1526,7 +1713,7 @@ module.exports = class RikkaPlugin extends Plugin {
 
   async createBoardCard(column, title, knownInfo = null) {
     const info = knownInfo || await this.getBoardInfo(column);
-    if (!info) throw new Error("Open the board as a page before adding an item.");
+    if (!info) throw new Error("Open the board as a page before adding a card.");
     const { baseFile, config, groupProperty } = info;
     // Put the card where the board will actually show it: the board's
     // "new item folder" if set, else the folder its filter looks in
@@ -1537,14 +1724,8 @@ module.exports = class RikkaPlugin extends Plugin {
       || (filterFolder && this.app.vault.getAbstractFileByPath(filterFolder) instanceof TFolder ? filterFolder : "")
       || baseFile.parent?.path || "";
     const safeTitle = title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, " — ").replace(/\s+/g, " ").trim().slice(0, 160);
-    if (!safeTitle) throw new Error("Enter a title for the item.");
-    const orders = Array.from(column.querySelectorAll(".base-board-card[data-file-path]")).map((card) => {
-      const file = this.app.vault.getAbstractFileByPath(card.dataset.filePath);
-      return file && this.app.metadataCache.getFileCache(file)?.frontmatter?.kanban_order;
-    });
-    const keys = orders.filter((order) => typeof order === "string").sort();
-    const numbers = orders.filter((order) => typeof order === "number" && Number.isFinite(order));
-    const order = keys.length ? keys[keys.length - 1] + "V" : numbers.length ? Math.max(...numbers) + 1000 : 1000;
+    if (!safeTitle) throw new Error("Enter a title for the card.");
+    const order = this.boardOrderKey(column, !!config?.newCardsToTop);
     const properties = { ...(config?.newItemProperties || {}), [groupProperty]: column.dataset.columnName, kanban_order: order };
     let path = `${folder ? folder + "/" : ""}${safeTitle}.md`;
     for (let suffix = 2; this.app.vault.getAbstractFileByPath(path); suffix++) {
@@ -1553,6 +1734,59 @@ module.exports = class RikkaPlugin extends Plugin {
     // Creating through the vault keeps Bases from opening the new note/properties.
     // The board refreshes from the normal vault event while its tab stays active.
     await this.app.vault.create(path, `---\n${stringifyYaml(properties).trimEnd()}\n---\n\n`);
+    this.noticeIfHiddenByFilter(column, path, safeTitle);
+    return path;
+  }
+
+  // Order key for a card placed at the top or bottom of a column, using Base
+  // Board's own fractional keys (kanban_order) so manual order persists.
+  boardOrderKey(column, atTop = false) {
+    const DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const values = Array.from(column?.querySelectorAll?.(".base-board-card[data-file-path]") || []).map((card) => {
+      const file = this.app.vault.getAbstractFileByPath(card.dataset.filePath);
+      return file && this.app.metadataCache.getFileCache(file)?.frontmatter?.kanban_order;
+    });
+    const keys = values.filter((v) => typeof v === "string" && v).sort();
+    const numbers = values.filter((v) => typeof v === "number" && Number.isFinite(v));
+    if (!keys.length) {
+      if (numbers.length) return atTop ? Math.min(...numbers) - 1000 : Math.max(...numbers) + 1000;
+      return "a0";
+    }
+    if (!atTop) return keys[keys.length - 1] + "V";
+    const first = keys[0];
+    // Decrement the integer part ("a5" → "a4", "a0" → "Zz"); keys sort as strings.
+    if (/^a[0-9A-Za-z]/.test(first) && first[1] !== "0") return "a" + DIGITS[DIGITS.indexOf(first[1]) - 1];
+    if (/^a0/.test(first)) return "Zz";
+    if (/^Z[0-9A-Za-z]{2}/.test(first) && first.slice(1, 3) !== "00") {
+      let n = DIGITS.indexOf(first[1]) * 62 + DIGITS.indexOf(first[2]) - 1;
+      return "Z" + DIGITS[Math.floor(n / 62)] + DIGITS[n % 62];
+    }
+    return keys[keys.length - 1] + "V"; // extreme edge: fall back to the bottom
+  }
+
+  // Non-drag move (card menu): change the column property and put the card
+  // at the bottom of the destination, in one frontmatter write.
+  async moveCardToColumn(file, board, name, info) {
+    const target = Array.from(board?.querySelectorAll(".base-board-column") || []).find((c) => c.dataset.columnName === name);
+    if (!target) throw new Error(`Column “${name}” no longer exists.`);
+    const order = this.boardOrderKey(target, false);
+    await this.app.fileManager.processFrontMatter(file, (fm) => { fm[info.groupProperty] = name; fm.kanban_order = order; });
+  }
+
+  // A board filter can hide a freshly created card; say so instead of
+  // letting it look like nothing happened.
+  noticeIfHiddenByFilter(column, path, title) {
+    const board = column?.closest?.(".base-board-board");
+    if (!board) return;
+    const visible = () => Array.from(board.querySelectorAll(".base-board-card[data-file-path]")).some((c) => c.dataset.filePath === path);
+    window.setTimeout(() => {
+      if (!board.isConnected || visible()) return;
+      window.setTimeout(() => {
+        if (board.isConnected && !visible() && this.app.vault.getAbstractFileByPath(path)) {
+          new Notice(`Added “${title}”, but this board's filter hides it.`);
+        }
+      }, 1500);
+    }, 500);
   }
 
   // ---- Board cards: create != open, and native back navigation ----
@@ -1704,7 +1938,7 @@ module.exports = class RikkaPlugin extends Plugin {
       const choices = names.map((name) => ({ value: name, label: name === current ? `${name}  · current` : name }));
       new RikkaChoiceModal(this.app, `Move “${file.basename}” to column…`, choices, (name) => {
         if (name === current) return;
-        return this.app.fileManager.processFrontMatter(file, (fm) => { fm[info.groupProperty] = name; });
+        return this.moveCardToColumn(file, board, name, info);
       }).open();
     }, "Move to column")));
     menu.addItem((entry) => entry.setTitle("Duplicate").setIcon("copy").onClick(safe(async () => {
@@ -1796,6 +2030,25 @@ module.exports = class RikkaPlugin extends Plugin {
         manager.__rikkaTouchCleanup?.();
         let state = null;
         let timer = 0;
+        // Phone layout stacks columns, so the board itself scrolls vertically:
+        // scroll it gently while a dragged card is held near its top/bottom edge.
+        let edgeSpeed = 0;
+        let edgeRAF = 0;
+        const stopEdge = () => { edgeSpeed = 0; if (edgeRAF) cancelAnimationFrame(edgeRAF); edgeRAF = 0; };
+        const edgeScroll = (y) => {
+          const rect = board.getBoundingClientRect();
+          const ZONE = 70, MAX = 9;
+          edgeSpeed = y < rect.top + ZONE ? -MAX * (1 - Math.max(0, y - rect.top) / ZONE)
+            : y > rect.bottom - ZONE ? MAX * (1 - Math.max(0, rect.bottom - y) / ZONE) : 0;
+          if (edgeSpeed && !edgeRAF) {
+            const tick = () => {
+              if (!edgeSpeed || !state?.active) { edgeRAF = 0; return; }
+              board.scrollTop += edgeSpeed;
+              edgeRAF = requestAnimationFrame(tick);
+            };
+            edgeRAF = requestAnimationFrame(tick);
+          }
+        };
         const clearPending = () => {
           window.clearTimeout(timer);
           timer = 0;
@@ -1839,6 +2092,7 @@ module.exports = class RikkaPlugin extends Plugin {
           const target = document.elementFromPoint(touch.clientX, touch.clientY);
           if (!target || !board.contains(target)) return;
           manager.updateAutoScroll(touch.clientX, touch.clientY, target);
+          if (Platform.isPhone) edgeScroll(touch.clientY);
           manager.handleCardDragOver({ target, clientX: touch.clientX, clientY: touch.clientY });
         };
         const onEnd = async (event) => {
@@ -1847,6 +2101,7 @@ module.exports = class RikkaPlugin extends Plugin {
           timer = 0;
           const drag = state;
           state = null;
+          stopEdge();
           if (!drag.active) return;
           this.mobileDragClickSuppression = Date.now() + 700;
           // Held without moving: that's a long-press, not a drag. Cancel the
@@ -1866,6 +2121,7 @@ module.exports = class RikkaPlugin extends Plugin {
           if (manager.dragType) manager.onDragEnd();
         };
         const onCancel = () => {
+          stopEdge();
           window.clearTimeout(timer);
           timer = 0;
           state = null;
@@ -1876,7 +2132,10 @@ module.exports = class RikkaPlugin extends Plugin {
         board.addEventListener("touchend", onEnd, { passive: true });
         board.addEventListener("touchcancel", onCancel, { passive: true });
         manager.__rikkaTouchBoard = board;
+        const chipsCleanup = Platform.isPhone ? this.attachColumnChips(board) : null;
         manager.__rikkaTouchCleanup = () => {
+          stopEdge();
+          chipsCleanup?.();
           window.clearTimeout(timer);
           board.removeEventListener("touchstart", onStart);
           board.removeEventListener("touchmove", onMove);
@@ -1893,6 +2152,60 @@ module.exports = class RikkaPlugin extends Plugin {
     this.mobileBoardObserver.observe(this.app.workspace.containerEl, { childList: true, subtree: true });
     this.register(() => this.mobileBoardObserver?.disconnect());
     attachTouchDrag();
+  }
+
+  // Phone: a compact row of column chips ("To do 12") above the stacked board.
+  // Tap a chip to jump to that column; the column on screen is highlighted.
+  attachColumnChips(board) {
+    const host = board.parentElement;
+    if (!host) return null;
+    host.querySelector(":scope > .rikka-column-chips")?.remove();
+    const bar = createDiv({ cls: "rikka-column-chips", attr: { role: "tablist", "aria-label": "Columns" } });
+    host.insertBefore(bar, board);
+    const columns = () => Array.from(board.querySelectorAll(".base-board-column")).filter((c) => c.dataset.columnName);
+    let signature = "";
+    const render = () => {
+      const list = columns();
+      const next = list.map((c) => `${c.dataset.columnName}:${c.querySelectorAll(".base-board-card[data-file-path]").length}`).join("|");
+      if (next === signature) return;
+      signature = next;
+      bar.empty();
+      for (const column of list) {
+        const name = column.dataset.columnName;
+        const chip = bar.createEl("button", { cls: "rikka-column-chip", attr: { type: "button", role: "tab", "data-column": name } });
+        chip.createSpan({ cls: "rikka-column-chip-name", text: name });
+        chip.createSpan({ cls: "rikka-column-chip-count", text: String(column.querySelectorAll(".base-board-card[data-file-path]").length) });
+        chip.addEventListener("click", () => {
+          const live = columns().find((c) => c.dataset.columnName === name);
+          if (!live) return;
+          const top = live.getBoundingClientRect().top - board.getBoundingClientRect().top + board.scrollTop;
+          board.scrollTo({ top: Math.max(0, top - 4), behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+        });
+      }
+      highlight();
+    };
+    const highlight = () => {
+      const boardTop = board.getBoundingClientRect().top;
+      let current = null;
+      for (const column of columns()) {
+        if (column.getBoundingClientRect().top - boardTop <= 40) current = column.dataset.columnName;
+      }
+      current ??= columns()[0]?.dataset.columnName;
+      bar.querySelectorAll(".rikka-column-chip").forEach((chip) => {
+        const on = chip.dataset.column === current;
+        chip.toggleClass("is-current", on);
+        chip.setAttribute("aria-selected", on ? "true" : "false");
+        if (on && (chip.offsetLeft < bar.scrollLeft || chip.offsetLeft + chip.offsetWidth > bar.scrollLeft + bar.clientWidth)) {
+          bar.scrollLeft = chip.offsetLeft - 12;
+        }
+      });
+    };
+    const onScroll = this.frameThrottle(highlight);
+    board.addEventListener("scroll", onScroll, { passive: true });
+    const observer = new MutationObserver(this.frameThrottle(render));
+    observer.observe(board, { childList: true, subtree: true });
+    render();
+    return () => { observer.disconnect(); board.removeEventListener("scroll", onScroll); bar.remove(); };
   }
 
   // Run fn at most once per animation frame (for MutationObserver callbacks).

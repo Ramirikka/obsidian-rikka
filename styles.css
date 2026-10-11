@@ -700,6 +700,33 @@ body.is-phone .base-board-column--collapsed .base-board-column-header {
   padding: 10px 12px;
 }
 
+/* Phone: column chips above the stacked board */
+.rikka-column-chips {
+  display: flex; gap: 6px; flex: 0 0 auto;
+  overflow-x: auto; scrollbar-width: none;
+  padding: 6px 10px; border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+.rikka-column-chips::-webkit-scrollbar { display: none; }
+.rikka-column-chip {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px;
+  min-height: 32px; padding: 0 12px; border-radius: var(--radius-l, 16px);
+  background: var(--background-secondary); color: var(--text-muted);
+  font-size: var(--font-ui-small); box-shadow: none; border: 1px solid transparent;
+}
+.rikka-column-chip.is-current { color: var(--text-normal); border-color: var(--interactive-accent); background: var(--background-modifier-hover); }
+.rikka-column-chip-count { font-variant-numeric: tabular-nums; opacity: .75; }
+.rikka-column-chip::after { content: ""; position: absolute; inset: -6px 0; } /* bigger touch target */
+.rikka-column-chip { position: relative; }
+
+/* Cards: intentional radius (not iOS input radius) and readable long titles */
+body.is-mobile .base-board-card { border-radius: var(--radius-m, 8px); }
+.base-board-card-title span {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
+  overflow-wrap: anywhere; unicode-bidi: plaintext; text-align: start;
+}
+@media (prefers-reduced-motion: reduce) { .base-board-card, .rikka-column-chip { transition: none !important; } }
+
 /* QA report */
 .rikka-qa-report .modal-content { max-height: 70vh; overflow-y: auto; font-size: var(--font-ui-small); }
 .rikka-qa-report ul { padding-left: 16px; }
