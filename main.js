@@ -1143,6 +1143,7 @@ module.exports = class RikkaPlugin extends Plugin {
           const board = saved.leaf?.view?.containerEl?.querySelector(".base-board-board");
           if (!board) return false;
           board.scrollLeft = saved.left;
+          board.scrollTop = saved.top || 0; // phone layout scrolls the board vertically
           board.querySelectorAll(".base-board-column").forEach((column) => {
             const top = saved.columns[column.dataset.columnName];
             const cards = column.querySelector(".base-board-cards");
@@ -1225,7 +1226,7 @@ module.exports = class RikkaPlugin extends Plugin {
       const cards = column.querySelector(".base-board-cards");
       if (cards) columns[column.dataset.columnName] = cards.scrollTop;
     });
-    this.savedBoardScroll = { basePath, leaf, left: board.scrollLeft, columns };
+    this.savedBoardScroll = { basePath, leaf, left: board.scrollLeft, top: board.scrollTop, columns };
   }
 
   installMobileBoardSupport() {

@@ -664,3 +664,38 @@ body.is-mobile .rikka-update-button { min-height: 44px; font-size: 15px; }
   padding: 10px 12px; border-radius: 10px;
 }
 .rikka-card-composer-done { flex: 0 0 auto; min-height: 44px; padding: 0 14px; border-radius: 10px; font-weight: 600; }
+
+/* ---- Phone: board as one vertical list of full-height columns ----
+   Columns stack full width and show every card; the whole board scrolls
+   vertically (no sideways swiping, no little scroll boxes inside columns). */
+body.is-phone .base-board-board {
+  flex-direction: column;
+  align-items: stretch;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  gap: 14px;
+  padding: 10px 10px calc(24px + env(safe-area-inset-bottom, 0px));
+}
+body.is-phone .base-board-column {
+  flex: 0 0 auto;
+  width: 100%;
+  max-height: none;
+  overflow: visible;
+}
+body.is-phone .base-board-cards {
+  flex: 0 0 auto;
+  overflow: visible;
+  max-height: none;
+}
+body.is-phone .base-board-column--collapsed {
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+body.is-phone .base-board-column--collapsed .base-board-column-header {
+  flex-direction: row;
+  padding: 10px 12px;
+}
