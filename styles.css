@@ -699,3 +699,9 @@ body.is-phone .base-board-column--collapsed .base-board-column-header {
   flex-direction: row;
   padding: 10px 12px;
 }
+
+/* QA report */
+.rikka-qa-report .modal-content { max-height: 70vh; overflow-y: auto; font-size: var(--font-ui-small); }
+.rikka-qa-report ul { padding-left: 16px; }
+.rikka-qa-pass { color: var(--text-muted); }
+.rikka-qa-fail { color: var(--text-error); font-weight: 600; }

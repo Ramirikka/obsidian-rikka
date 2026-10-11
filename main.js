@@ -693,6 +693,389 @@ class RikkaMentionSuggest extends EditorSuggest {
   }
 }
 
+// ===========================================================================
+// Rikka QA: automated desktop + mobile-emulation regression suite.
+// Commands: "Rikka QA: run desktop tests", "...mobile tests", "...all tests".
+// Mobile runs use Obsidian's own app.emulateMobile(true) (which reloads the
+// app), resume after reload, then restore desktop mode. Everything happens in
+// a throwaway "_Rikka QA" folder that is moved to the system trash at the end.
+// ===========================================================================
+
+const RIKKA_QA_KEY = "rikka-qa-state";
+
+class RikkaQAReportModal extends Modal {
+  constructor(app, results) {
+    super(app);
+    this.results = results;
+  }
+  onOpen() {
+    this.modalEl.addClass("rikka-qa-report");
+    const all = Object.values(this.results).flat();
+    const failed = all.filter((r) => !r.ok);
+    this.setTitle(`Rikka QA — ${all.length - failed.length}/${all.length} passed`);
+    for (const [suite, rows] of Object.entries(this.results)) {
+      this.contentEl.createEl("h4", { text: suite });
+      const list = this.contentEl.createEl("ul");
+      for (const r of rows) {
+        const li = list.createEl("li", { cls: r.ok ? "rikka-qa-pass" : "rikka-qa-fail" });
+        li.setText(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.detail ? ` — ${r.detail}` : ""}`);
+      }
+    }
+  }
+}
+
+class RikkaQA {
+  constructor(plugin) {
+    this.plugin = plugin;
+    this.app = plugin.app;
+    this.rows = [];
+  }
+
+  wait(ms) { return new Promise((r) => window.setTimeout(r, ms)); }
+  async waitFor(fn, timeout = 4000, step = 50) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      try { const v = await fn(); if (v) return v; } catch (e) { /* retry */ }
+      await this.wait(step);
+    }
+    return null;
+  }
+  check(name, ok, detail = "") {
+    this.rows.push({ name, ok: Boolean(ok), detail: ok ? "" : String(detail || "") });
+    console[ok ? "log" : "warn"](`[Rikka QA] ${ok ? "PASS" : "FAIL"} ${name}${ok ? "" : ` — ${detail}`}`);
+  }
+  async step(name, fn) {
+    try { await fn(); } catch (error) { this.check(name, false, error?.message || error); }
+  }
+  file(path) { return this.app.vault.getAbstractFileByPath(path); }
+  view() { return this.plugin.getView(); }
+  q(sel, root = document) { return root.querySelector(sel); }
+  tap(el) {
+    // A touch-like tap: pointer + touch + click, as one user action produces.
+    const r = el.getBoundingClientRect();
+    const opts = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    el.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerType: "touch" }));
+    el.dispatchEvent(new PointerEvent("pointerup", { ...opts, pointerType: "touch" }));
+    el.dispatchEvent(new MouseEvent("click", opts));
+  }
+  async submitName(name) {
+    const input = await this.waitFor(() => this.q(".rikka-name-modal-input"));
+    if (!input) throw new Error("name dialog did not open");
+    const title = this.q(".rikka-name-modal .modal-title")?.textContent || "";
+    input.value = name;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.closest("form").requestSubmit();
+    await this.waitFor(() => !this.q(".rikka-name-modal"), 3000);
+    return title;
+  }
+
+  // ---- fixture ------------------------------------------------------------
+  async setup(mode) {
+    const root = this.plugin.activeProject.path;
+    this.sandbox = `${root}/_Rikka QA ${mode}`;
+    if (this.file(this.sandbox)) await this.app.fileManager.trashFile(this.file(this.sandbox));
+    await this.app.vault.createFolder(this.sandbox);
+    await this.plugin.activateView();
+    await this.waitFor(() => this.view()?.containerEl.querySelector(".rikka-section"));
+  }
+  async teardown() {
+    for (const leaf of this.app.workspace.getLeavesOfType("bases").concat(this.app.workspace.getLeavesOfType("markdown"))) {
+      const path = leaf.view?.file?.path || "";
+      if (path.startsWith(this.sandbox)) leaf.detach();
+    }
+    const research = (p) => p.startsWith(this.sandbox) || p.includes("Mobile Context Test");
+    this.plugin.data.research = this.plugin.data.research.filter((p) => !research(p));
+    const stray = this.file(`${this.plugin.activeProject.path}/Mobile Context Test.md`);
+    if (stray) await this.app.fileManager.trashFile(stray);
+    if (this.file(this.sandbox)) await this.app.fileManager.trashFile(this.file(this.sandbox));
+    this.plugin.data.context = { section: "draft", folder: "" };
+    await this.plugin.saveState();
+  }
+
+  // ---- suites -------------------------------------------------------------
+  async run(mode) {
+    const isMobile = Platform.isMobile;
+    this.check(`Obsidian reports ${mode} mode`, mode === "mobile" ? isMobile : !isMobile, `Platform.isMobile=${isMobile}`);
+    await this.setup(mode);
+    try {
+      await this.contextFlows(mode);
+      await this.fileFlows(mode);
+      await this.boardFlows(mode);
+      await this.editorFlows(mode);
+      if (mode === "mobile") await this.layoutChecks();
+    } finally {
+      await this.teardown();
+    }
+    return this.rows;
+  }
+
+  async contextFlows(mode) {
+    const v = this.view();
+    const root = this.plugin.activeProject.path;
+    await this.step("Research: tap makes it current, New document says 'in Research', file lands in Research", async () => {
+      const heading = await this.waitFor(() => v.containerEl.querySelector('[data-context-section="research"]'));
+      this.tap(heading);
+      await this.waitFor(() => this.plugin.data.context.section === "research");
+      await this.waitFor(() => v.containerEl.querySelector('[data-context-section="research"].is-context'));
+      this.check("Research heading shows active state", v.containerEl.querySelector('[data-context-section="research"].is-context'), "no .is-context");
+      this.tap(v.containerEl.querySelector('[aria-label="New document here"]'));
+      const title = await this.submitName("Mobile Context Test");
+      this.check("Dialog title is 'New document in Research'", title === "New document in Research", title);
+      const path = `${root}/Mobile Context Test.md`;
+      await this.waitFor(() => this.file(path));
+      this.check("File created and registered in Research", this.file(path) && this.plugin.data.research.includes(path), path);
+      this.check("Research is still the current location", this.plugin.data.context.section === "research" && !this.plugin.data.context.folder, JSON.stringify(this.plugin.data.context));
+    });
+
+    await this.step("Nested folder: New folder in X, open it, New document lands inside", async () => {
+      this.plugin.setContext("draft", this.sandbox, { expandFolder: true });
+      await this.waitFor(() => v.containerEl.querySelector(`.rikka-row[data-path="${CSS.escape(this.sandbox)}"]`));
+      this.tap(v.containerEl.querySelector('[aria-label="New folder here"]'));
+      const ftitle = await this.submitName("Competitors");
+      this.check("Folder dialog names the current folder", ftitle === `New folder in _Rikka QA ${mode}`, ftitle);
+      const folder = `${this.sandbox}/Competitors`;
+      await this.waitFor(() => this.file(folder));
+      this.check("Folder created inside the current folder", this.file(folder) instanceof TFolder, folder);
+      const row = await this.waitFor(() => v.containerEl.querySelector(`.rikka-folder-row[data-path="${CSS.escape(folder)}"]`));
+      this.tap(row.querySelector(".rikka-row-title"));
+      await this.waitFor(() => this.plugin.data.context.folder === folder);
+      this.check("Tapping folder name makes it current", this.plugin.data.context.folder === folder, JSON.stringify(this.plugin.data.context));
+      this.check("Location bar shows nested path", (v.containerEl.querySelector(".rikka-location-path")?.textContent || "").endsWith("/ Competitors"), v.containerEl.querySelector(".rikka-location-path")?.textContent);
+      this.tap(v.containerEl.querySelector('[aria-label="New document here"]'));
+      const dtitle = await this.submitName("Pricing");
+      this.check("Doc dialog says 'New document in Competitors'", dtitle === "New document in Competitors", dtitle);
+      await this.waitFor(() => this.file(`${folder}/Pricing.md`));
+      this.check("Document created in Competitors", this.file(`${folder}/Pricing.md`), `${folder}/Pricing.md`);
+      this.check("Nothing created at project root", !this.file(`${root}/Pricing.md`));
+    });
+
+    await this.step("Chevron toggles without changing location", async () => {
+      const folder = `${this.sandbox}/Competitors`;
+      const row = v.containerEl.querySelector(`.rikka-folder-row[data-path="${CSS.escape(folder)}"]`);
+      const before = JSON.stringify(this.plugin.data.context);
+      this.tap(row.querySelector(".rikka-row-disclosure"));
+      await this.wait(250);
+      this.check("Arrow collapses folder", this.plugin.data.collapsed[`folder:draft:${folder}`] === true);
+      this.check("Arrow does not change location", JSON.stringify(this.plugin.data.context) === before);
+      this.tap(v.containerEl.querySelector(`.rikka-folder-row[data-path="${CSS.escape(folder)}"] .rikka-row-disclosure`));
+      await this.wait(250);
+    });
+
+    await this.step("Duplicate name proposes the next free name", async () => {
+      this.tap(v.containerEl.querySelector('[aria-label="New document here"]'));
+      const input = await this.waitFor(() => this.q(".rikka-name-modal-input"));
+      input.value = "Pricing"; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit();
+      await this.waitFor(() => this.q(".rikka-name-modal-input")?.value === "Pricing 2");
+      this.check("Proposes 'Pricing 2' and keeps dialog open", this.q(".rikka-name-modal-input")?.value === "Pricing 2", this.q(".rikka-name-modal-input")?.value);
+      this.q(".rikka-name-modal .modal-close-button")?.click();
+      await this.wait(200);
+    });
+  }
+
+  async fileFlows(mode) {
+    const folder = `${this.sandbox}/Competitors`;
+    await this.step("Rename current folder keeps it current and expanded", async () => {
+      await this.app.fileManager.renameFile(this.file(folder), `${this.sandbox}/Rivals`);
+      await this.waitFor(() => this.plugin.data.context.folder === `${this.sandbox}/Rivals`);
+      this.check("Context follows rename", this.plugin.data.context.folder === `${this.sandbox}/Rivals`, this.plugin.data.context.folder);
+      this.check("Expanded state follows rename", this.plugin.data.collapsed[`folder:draft:${this.sandbox}/Rivals`] === false);
+      this.check("Only the folder was renamed (child intact)", this.file(`${this.sandbox}/Rivals/Pricing.md`) && !this.file(`${this.sandbox}/Competitors`));
+    });
+    await this.step("Rename a document renames only that document", async () => {
+      await this.app.vault.create(`${this.sandbox}/Alpha.md`, "a");
+      await this.app.vault.create(`${this.sandbox}/Beta.md`, "b");
+      await this.app.fileManager.renameFile(this.file(`${this.sandbox}/Alpha.md`), `${this.sandbox}/Alpha renamed.md`);
+      await this.wait(300);
+      const names = this.file(this.sandbox).children.map((c) => c.name).sort();
+      this.check("Sibling untouched after rename", names.includes("Beta.md") && names.includes("Alpha renamed.md") && !names.includes("Alpha.md"), names.join(", "));
+      this.check("Contents untouched after rename", (await this.app.vault.read(this.file(`${this.sandbox}/Beta.md`))) === "b");
+    });
+    await this.step("Move, duplicate, delete-current-folder fallback", async () => {
+      await this.plugin.moveIntoFolder(`${this.sandbox}/Beta.md`, this.file(`${this.sandbox}/Rivals`));
+      this.check("Move puts the real file in the folder", this.file(`${this.sandbox}/Rivals/Beta.md`) && !this.file(`${this.sandbox}/Beta.md`));
+      await this.plugin.duplicateFile(this.file(`${this.sandbox}/Rivals/Beta.md`));
+      this.check("Duplicate creates 'Beta copy'", this.file(`${this.sandbox}/Rivals/Beta copy.md`));
+      await this.app.fileManager.trashFile(this.file(`${this.sandbox}/Rivals`));
+      await this.waitFor(() => this.plugin.data.context.folder === this.sandbox);
+      this.check("Deleted current folder falls back to parent", this.plugin.data.context.folder === this.sandbox, this.plugin.data.context.folder);
+    });
+  }
+
+  async openBoard() {
+    const cards = `${this.sandbox}/Cards`;
+    await this.app.vault.createFolder(cards);
+    for (const [title, status] of [["Card A", "To Do"], ["Card B", "To Do"], ["Card C", "Doing"], ["Card D", "Done"]]) {
+      await this.app.vault.create(`${cards}/${title}.md`, `---\nstatus: ${status}\n---\n`);
+    }
+    const base = `${this.sandbox}/QA Board.base`;
+    await this.app.vault.create(base, [
+      "filters:", "  and:", `    - file.inFolder("${cards}")`,
+      "views:", "  - type: base-board", "    name: QA Board", "    groupBy:", "      property: note.status", "      direction: ASC", "",
+    ].join("\n"));
+    const leaf = this.app.workspace.getLeaf(Platform.isMobile ? false : "tab");
+    await leaf.openFile(this.file(base), { active: true });
+    const board = await this.waitFor(() => leaf.view?.containerEl?.querySelector(".base-board-board .base-board-card"), 6000);
+    return { leaf, base, cards, board: board && leaf.view.containerEl.querySelector(".base-board-board") };
+  }
+
+  async boardFlows(mode) {
+    let ctx;
+    await this.step("Open test board", async () => {
+      ctx = await this.openBoard();
+      this.check("Board renders cards", ctx.board, "no .base-board-card rendered");
+    });
+    if (!ctx?.board) return;
+    const { leaf, cards } = ctx;
+    const boardEl = () => leaf.view.containerEl.querySelector(".base-board-board");
+    const column = (name) => Array.from(boardEl().querySelectorAll(".base-board-column")).find((c) => c.dataset.columnName === name);
+
+    await this.step("Add card: card appears, nothing opens, board stays", async () => {
+      const col = column("Doing") || boardEl().querySelector(".base-board-column");
+      const colName = col.dataset.columnName;
+      if (mode === "mobile") {
+        boardEl().scrollTop = 120;
+        boardEl().scrollLeft = 200;
+      } else {
+        boardEl().scrollLeft = 200;
+      }
+      const before = { top: boardEl().scrollTop, left: boardEl().scrollLeft };
+      const plus = col.querySelector(".base-board-column-add-card, .base-board-column-add-card-footer-button");
+      this.tap(plus);
+      let input;
+      if (mode === "mobile") {
+        input = await this.waitFor(() => this.q(".rikka-card-composer-input"));
+        this.check("Mobile: composer opens", input, "no .rikka-card-composer");
+        const bar = this.q(".rikka-card-composer")?.getBoundingClientRect();
+        this.check("Mobile: composer is fully on screen", bar && bar.top >= 0 && bar.bottom <= window.innerHeight, JSON.stringify(bar));
+      } else {
+        input = await this.waitFor(() => col.querySelector(".rikka-board-card-input") || column(colName)?.querySelector(".rikka-board-card-input"));
+        this.check("Desktop: inline input opens", input, "no .rikka-board-card-input");
+      }
+      if (!input) return;
+      const leafBefore = this.app.workspace.getMostRecentLeaf();
+      for (const title of ["QA new card 1", "QA new card 2"]) {
+        input.value = title;
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+        await this.waitFor(() => this.file(`${cards}/${title}.md`), 4000);
+        await this.wait(500);
+        if (mode !== "mobile") input = column(colName)?.querySelector(".rikka-board-card-input") || input;
+      }
+      this.check("Both cards created as files", this.file(`${cards}/QA new card 1.md`) && this.file(`${cards}/QA new card 2.md`));
+      const fm = this.app.metadataCache.getFileCache(this.file(`${cards}/QA new card 1.md`))?.frontmatter;
+      this.check("Card gets the column's status", fm?.status === colName, JSON.stringify(fm));
+      await this.waitFor(() => Array.from(boardEl().querySelectorAll(".base-board-card")).some((c) => c.dataset.filePath === `${cards}/QA new card 2.md`));
+      this.check("New card visible on the board", Array.from(boardEl().querySelectorAll(".base-board-card")).some((c) => c.dataset.filePath === `${cards}/QA new card 2.md`));
+      this.check("Card detail did NOT open (same leaf shows board)", leaf.view?.file?.path === ctx.base, leaf.view?.file?.path);
+      this.check("No modal opened", !this.q(".modal-container .base-board-card-modal"));
+      this.check("Active leaf unchanged", this.app.workspace.getMostRecentLeaf() === leafBefore);
+      const after = { top: boardEl().scrollTop, left: boardEl().scrollLeft };
+      this.check("Board did not jump", Math.abs(after.top - before.top) < 40 && Math.abs(after.left - before.left) < 40, `${JSON.stringify(before)} → ${JSON.stringify(after)}`);
+      if (mode === "mobile") {
+        this.check("Composer stays open for the next card", this.q(".rikka-card-composer-input"));
+        this.tap(this.q(".rikka-card-composer-done"));
+        await this.waitFor(() => !this.q(".rikka-card-composer"));
+        this.check("Done closes the composer", !this.q(".rikka-card-composer"));
+      } else {
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      }
+    });
+
+    await this.step("Tap card opens it; Back returns to the same board and position", async () => {
+      await this.wait(1300); // past the post-create click guard
+      const card = Array.from(boardEl().querySelectorAll(".base-board-card")).find((c) => c.dataset.filePath === `${cards}/Card A.md`);
+      const pos = { top: boardEl().scrollTop, left: boardEl().scrollLeft };
+      this.tap(card.querySelector(".base-board-card-title") || card);
+      if (mode === "mobile") {
+        await this.waitFor(() => leaf.view?.file?.path === `${cards}/Card A.md`, 4000);
+        this.check("Mobile: card opens in the board's tab", leaf.view?.file?.path === `${cards}/Card A.md`, leaf.view?.file?.path);
+        leaf.history?.back?.();
+        await this.waitFor(() => leaf.view?.file?.path === ctx.base, 4000);
+        this.check("Back returns to the same board", leaf.view?.file?.path === ctx.base, leaf.view?.file?.path);
+        await this.waitFor(() => boardEl()?.querySelector(".base-board-card"), 4000);
+        await this.wait(500);
+        const now = { top: boardEl().scrollTop, left: boardEl().scrollLeft };
+        this.check("Scroll position restored", Math.abs(now.top - pos.top) < 60 && Math.abs(now.left - pos.left) < 60, `${JSON.stringify(pos)} → ${JSON.stringify(now)}`);
+      } else {
+        const opened = await this.waitFor(() => {
+          let found = false;
+          this.app.workspace.iterateAllLeaves((l) => { if (l.view?.file?.path === `${cards}/Card A.md`) found = true; });
+          return found || this.q(".base-board-card-modal");
+        }, 4000);
+        this.check("Desktop: tapping a card opens it", opened);
+        this.q(".base-board-card-modal")?.closest(".modal-container")?.querySelector(".modal-close-button")?.click();
+      }
+    });
+
+    if (mode === "mobile") {
+      await this.step("Phone layout: full-height stacked columns, vertical scroll", async () => {
+        if (!document.body.hasClass("is-phone")) { this.check("Phone layout (needs is-phone)", true); return; }
+        const style = getComputedStyle(boardEl());
+        this.check("Board stacks columns vertically", style.flexDirection === "column", style.flexDirection);
+        const cardsBox = boardEl().querySelector(".base-board-cards");
+        this.check("Columns are not inner-scroll boxes", getComputedStyle(cardsBox).overflowY === "visible", getComputedStyle(cardsBox).overflowY);
+        this.check("No horizontal overflow", boardEl().scrollWidth <= boardEl().clientWidth + 2, `${boardEl().scrollWidth} > ${boardEl().clientWidth}`);
+      });
+    }
+  }
+
+  async editorFlows(mode) {
+    await this.step("Slash menu opens at a line start and converts in one undo step", async () => {
+      const path = `${this.sandbox}/Editor test.md`;
+      await this.app.vault.create(path, "Hello\n");
+      const leaf = this.app.workspace.getLeaf(false);
+      await leaf.openFile(this.file(path), { active: true, state: { mode: "source" } });
+      const editor = await this.waitFor(() => leaf.view?.editor);
+      editor.focus();
+      editor.setCursor({ line: 1, ch: 0 });
+      editor.replaceRange("/hea", { line: 1, ch: 0 });
+      editor.setCursor({ line: 1, ch: 4 });
+      const pop = await this.waitFor(() => this.q(".suggestion-container .rikka-slash-item"), 2500);
+      this.check("Slash menu appears", pop, "no .rikka-slash-item");
+      if (pop) {
+        const box = pop.closest(".suggestion-container").getBoundingClientRect();
+        this.check("Slash menu fully on screen", box.top >= 0 && box.bottom <= window.innerHeight + 1 && box.left >= 0 && box.right <= window.innerWidth + 1, JSON.stringify(box));
+        const first = this.q(".suggestion-container .suggestion-item")?.textContent || "";
+        this.check("'/hea' lists Heading first", first.includes("Heading"), first);
+      }
+      this.plugin.setLineKind(editor, { from: { line: 1, ch: 0 }, to: { line: 1, ch: 4 } }, "h2");
+      this.check("Turned into heading", editor.getLine(1).startsWith("## "), editor.getLine(1));
+      editor.undo();
+      this.check("One undo restores '/hea'", editor.getLine(1) === "/hea", editor.getLine(1));
+      editor.setValue("See https://example.com/foo/bar");
+      editor.setCursor({ line: 0, ch: editor.getLine(0).length });
+      await this.wait(400);
+      this.check("URLs do not open the slash menu", !this.q(".suggestion-container .rikka-slash-item"));
+      leaf.detach();
+    });
+  }
+
+  async layoutChecks() {
+    await this.step("Touch targets and toolbar", async () => {
+      const v = this.view();
+      const buttons = Array.from(v.containerEl.querySelectorAll(".rikka-toolbar .rikka-icon-button"));
+      const small = buttons.filter((b) => { const r = b.getBoundingClientRect(); return r.width < 40 || r.height < 40; });
+      this.check("Toolbar buttons ≥ 40px", !small.length, small.map((b) => b.getAttribute("aria-label")).join(", "));
+      this.check("Toolbar has at most 3 actions", buttons.length <= 3, String(buttons.length));
+      const rows = Array.from(v.containerEl.querySelectorAll(".rikka-row")).slice(0, 10);
+      const shortRows = rows.filter((r) => r.getBoundingClientRect().height < 38);
+      this.check("Binder rows ≥ 38px tall", !shortRows.length, `${shortRows.length} short rows`);
+      const overflow = v.containerEl.scrollWidth > v.containerEl.clientWidth + 2;
+      this.check("Binder has no horizontal overflow", !overflow);
+    });
+  }
+}
+
+// --- orchestration across emulateMobile reloads ---------------------------
+function rikkaQaState(next) {
+  try {
+    if (next === undefined) return JSON.parse(window.localStorage.getItem(RIKKA_QA_KEY) || "null");
+    if (next === null) window.localStorage.removeItem(RIKKA_QA_KEY);
+    else window.localStorage.setItem(RIKKA_QA_KEY, JSON.stringify(next));
+  } catch (error) { return null; }
+  return next;
+}
+
 class RikkaSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -813,6 +1196,7 @@ module.exports = class RikkaPlugin extends Plugin {
     this.installNewCardOpenGuard();
     this.installEditorFeatures();
     this.installUpdateChecker();
+    this.installQA();
 
     this.app.workspace.onLayoutReady(() => {
       this.validateContext();
@@ -820,7 +1204,63 @@ module.exports = class RikkaPlugin extends Plugin {
     });
   }
 
+  // ---- QA commands (desktop / mobile emulation / all) ---------------------
+  installQA() {
+    this.addCommand({ id: "qa-desktop", name: "QA: run desktop tests", callback: () => this.startQA(["desktop"]) });
+    this.addCommand({ id: "qa-mobile", name: "QA: run mobile tests (emulated)", callback: () => this.startQA(["mobile"]) });
+    this.addCommand({ id: "qa-all", name: "QA: run all tests (desktop + mobile)", callback: () => this.startQA(["desktop", "mobile"]) });
+    this.app.workspace.onLayoutReady(() => window.setTimeout(() => this.resumeQA(), 2500));
+  }
+
+  async startQA(queue) {
+    rikkaQaState({ queue: [...queue, "finish"], results: {}, desktopWasMobile: Platform.isMobile });
+    await this.resumeQA();
+  }
+
+  // Runs the next queued step. Switching between desktop and mobile uses
+  // Obsidian's own app.emulateMobile(), which reloads; we resume afterwards.
+  async resumeQA() {
+    const state = rikkaQaState();
+    if (!state?.queue?.length || this.qaRunning) return;
+    const next = state.queue[0];
+    const wantMobile = next === "mobile";
+    if (next === "finish") {
+      if (Platform.isMobile && !state.desktopWasMobile) return this.switchEmulation(false);
+      rikkaQaState(null);
+      new RikkaQAReportModal(this.app, state.results).open();
+      return;
+    }
+    if (Platform.isMobile !== wantMobile) return this.switchEmulation(wantMobile);
+    this.qaRunning = true;
+    new Notice(`Rikka QA: running ${next} tests…`);
+    try {
+      const rows = await new RikkaQA(this).run(next);
+      state.results[next === "mobile" ? "Mobile (emulated)" : "Desktop"] = rows;
+    } catch (error) {
+      state.results[next] = [{ name: "Suite crashed", ok: false, detail: error?.stack || String(error) }];
+    } finally {
+      this.qaRunning = false;
+    }
+    state.queue.shift();
+    rikkaQaState(state);
+    await this.resumeQA();
+  }
+
+  switchEmulation(mobile) {
+    if (typeof this.app.emulateMobile !== "function") {
+      const state = rikkaQaState();
+      state.results.Setup = [{ name: "app.emulateMobile is available", ok: false, detail: "not available in this Obsidian build" }];
+      state.queue = ["finish"];
+      rikkaQaState(state);
+      return this.resumeQA();
+    }
+    this.app.emulateMobile(mobile);
+    // If this Obsidian version switches without a full reload, continue here.
+    window.setTimeout(() => { if (!this.unloaded) this.resumeQA(); }, 4000);
+  }
+
   onunload() {
+    this.unloaded = true;
     this.composerCleanup?.();
     window.clearTimeout(this.refreshTimer);
     window.clearTimeout(this.renderTimer);
