@@ -903,6 +903,19 @@ class RikkaQA {
       this.check("Sibling untouched after rename", names.includes("Beta.md") && names.includes("Alpha renamed.md") && !names.includes("Alpha.md"), names.join(", "));
       this.check("Contents untouched after rename", (await this.app.vault.read(this.file(`${this.sandbox}/Beta.md`))) === "b");
     });
+    if (mode !== "mobile") await this.step("Opening from Binder uses the current tab, not the first", async () => {
+      const ws = this.app.workspace;
+      const tabA = ws.getLeaf("tab");
+      await tabA.openFile(this.file(`${this.sandbox}/Alpha renamed.md`), { active: true });
+      const tabB = ws.getLeaf("tab");
+      ws.setActiveLeaf(tabB, { focus: true });
+      await this.wait(200);
+      await this.plugin.openFile(this.file(`${this.sandbox}/Beta.md`));
+      await this.wait(300);
+      this.check("Document opens in the tab you're in", tabB.view?.file?.path === `${this.sandbox}/Beta.md`, tabB.view?.file?.path);
+      this.check("Other tab keeps its document", tabA.view?.file?.path === `${this.sandbox}/Alpha renamed.md`, tabA.view?.file?.path);
+      tabA.detach(); tabB.detach();
+    });
     await this.step("Move, duplicate, delete-current-folder fallback", async () => {
       await this.plugin.moveIntoFolder(`${this.sandbox}/Beta.md`, this.file(`${this.sandbox}/Rivals`));
       this.check("Move puts the real file in the folder", this.file(`${this.sandbox}/Rivals/Beta.md`) && !this.file(`${this.sandbox}/Beta.md`));
@@ -2139,18 +2152,19 @@ module.exports = class RikkaPlugin extends Plugin {
   }
 
   async openFile(file, newTab = false, split = false) {
-    // Reuse the leftmost main-workspace tab for ordinary navigation, including
-    // on mobile where the active leaf can be the Binder in the left sidebar.
-    let firstLeaf = null;
-    this.app.workspace.iterateRootLeaves((candidate) => {
-      if (!firstLeaf) firstLeaf = candidate;
-    });
+    // Open in the main-area tab the user was last working in (not the first
+    // tab), even when focus is currently on the Binder in the sidebar.
+    const ws = this.app.workspace;
+    let target = ws.getMostRecentLeaf?.(ws.rootSplit) || null;
+    if (!target || target.getRoot?.() !== ws.rootSplit) {
+      ws.iterateRootLeaves((candidate) => { if (!target) target = candidate; });
+    }
     const leaf = split
-      ? this.app.workspace.getLeaf("split", "vertical")
+      ? ws.getLeaf("split", "vertical")
       : newTab
-        ? this.app.workspace.getLeaf("tab")
-        : firstLeaf || this.app.workspace.getLeaf(false);
-    await leaf.openFile(file);
+        ? ws.getLeaf("tab")
+        : target || ws.getLeaf(false);
+    await leaf.openFile(file, { active: true });
     if (Platform.isMobile && !newTab && !split) {
       this.app.workspace.setActiveLeaf(leaf, { focus: true });
       this.app.workspace.leftSplit?.collapse();
