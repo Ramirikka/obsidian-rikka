@@ -887,11 +887,14 @@ module.exports = class RikkaPlugin extends Plugin {
     });
     const done = row.createEl("button", { cls: "rikka-card-composer-done", text: "Done", attr: { type: "button" } });
 
-    // Keep the bar glued to the top of the keyboard.
+    // Pinned to the top of the visible screen (under Obsidian's header), the
+    // one place the keyboard can never cover. Follows the visual viewport so
+    // it stays put even if iOS scrolls the page when the keyboard opens.
     const vv = window.visualViewport;
+    const header = document.querySelector(".workspace-leaf.mod-active .view-header, .view-header");
+    const headerBottom = () => Math.max(0, header?.getBoundingClientRect().bottom || 0);
     const place = () => {
-      const keyboard = vv ? Math.max(0, window.innerHeight - (vv.height + vv.offsetTop)) : 0;
-      bar.style.bottom = `${keyboard}px`;
+      bar.style.top = `${(vv?.offsetTop || 0) + headerBottom()}px`;
     };
     place();
     vv?.addEventListener("resize", place);
@@ -1227,6 +1230,23 @@ module.exports = class RikkaPlugin extends Plugin {
 
   installMobileBoardSupport() {
     if (!Platform.isMobile) return;
+    // Whatever opened Base Board's own inline "new card" input, swap it for
+    // Rikka's composer so typing is always visible and nothing jumps.
+    this.registerDomEvent(document, "focusin", (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || !input.matches(".base-board-add-card-input") || input.matches(".rikka-board-card-input")) return;
+      const column = input.closest(".base-board-column");
+      if (!column) return;
+      const wrapper = input.closest(".base-board-add-card-input-wrapper");
+      input.value = "";
+      input.blur();
+      // Removing Base Board's input after clearing it means its blur-commit does nothing.
+      window.setTimeout(() => {
+        wrapper?.remove();
+        column.querySelectorAll(".base-board-hidden").forEach((el) => el.classList.remove("base-board-hidden"));
+      }, 0);
+      void this.startBoardCardComposer(column);
+    }, true);
     // One gesture = one menu: Rikka's long-press menu replaces the long-press
     // context menu on board cards, so two menus never stack up.
     this.registerDomEvent(document, "contextmenu", (event) => {
