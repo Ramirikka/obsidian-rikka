@@ -2784,6 +2784,40 @@ module.exports = class RikkaPlugin extends Plugin {
     this.availableUpdate = null;
     this.addCommand({ id: "update-rikka", name: "Update Rikka", icon: "download", callback: () => this.installUpdate(true) });
     this.addSettingTab(new RikkaSettingTab(this.app, this));
+    this.installGeneralUpdateRow();
+  }
+
+  // Settings → General: an "Update Rikka" row right under Obsidian's own
+  // version / "Check for updates" row. Only acts when the button is pressed.
+  installGeneralUpdateRow() {
+    const addRow = () => {
+      const setting = this.app.setting;
+      if (!setting?.activeTab || setting.activeTab.id !== "about") return;
+      const content = setting.activeTab.containerEl;
+      if (!content || content.querySelector(".rikka-general-update")) return;
+      const first = content.querySelector(".setting-item");
+      if (!first) return;
+      const row = createDiv({ cls: "setting-item rikka-general-update" });
+      const info = row.createDiv({ cls: "setting-item-info" });
+      info.createDiv({ cls: "setting-item-name", text: "Rikka" });
+      const desc = info.createDiv({ cls: "setting-item-description", text: `Current version: ${this.manifest.version}` });
+      void this.installedVersion().then((v) => desc.setText(`Current version: ${v}`));
+      const control = row.createDiv({ cls: "setting-item-control" });
+      const button = control.createEl("button", { text: "Update Rikka" });
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        button.setText("Checking…");
+        try { await this.installUpdate(true); } finally {
+          button.disabled = false;
+          button.setText("Update Rikka");
+          desc.setText(`Current version: ${await this.installedVersion()}`);
+        }
+      });
+      first.after(row);
+    };
+    const observer = new MutationObserver(this.frameThrottle(addRow));
+    observer.observe(document.body, { childList: true, subtree: true });
+    this.register(() => { observer.disconnect(); document.querySelectorAll(".rikka-general-update").forEach((el) => el.remove()); });
   }
 
   // The version actually installed on disk (Obsidian keeps the version it
