@@ -821,6 +821,7 @@ module.exports = class RikkaPlugin extends Plugin {
   }
 
   onunload() {
+    this.composerCleanup?.();
     window.clearTimeout(this.refreshTimer);
     window.clearTimeout(this.renderTimer);
     this.mobileBoardObserver?.disconnect();
@@ -848,12 +849,106 @@ module.exports = class RikkaPlugin extends Plugin {
       if (!column) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      this.startBoardCardInput(column);
+      if (Platform.isMobile) this.startBoardCardComposer(column);
+      else this.startBoardCardInput(column);
     }, true);
     const observer = new MutationObserver(this.frameThrottle(enhance));
     observer.observe(this.app.workspace.containerEl, { childList: true, subtree: true });
     this.register(() => observer.disconnect());
     enhance();
+  }
+
+  // Mobile: a composer bar pinned just above the keyboard. It lives outside the
+  // board, so Base Board redrawing the column can't move or remove it, the
+  // keyboard never covers it, and nothing on the board scrolls or jumps.
+  // Return adds the card and keeps the bar ready for the next one; Done closes.
+  async startBoardCardComposer(column) {
+    document.querySelector(".rikka-card-composer")?.remove();
+    const columnName = column.dataset.columnName || "";
+    const board = column.closest(".base-board-board");
+    const info = await this.getBoardInfo(column);
+    if (!info) { new Notice("Open the board as a page before adding an item."); return; }
+    const liveColumn = () => {
+      if (column.isConnected) return column;
+      const fresh = Array.from(board?.querySelectorAll(".base-board-column") || []).find((el) => el.dataset.columnName === columnName);
+      if (fresh) column = fresh;
+      return column;
+    };
+
+    const bar = document.body.createDiv({ cls: "rikka-card-composer" });
+    const label = bar.createDiv({ cls: "rikka-card-composer-label" });
+    label.createSpan({ text: "Add card to " });
+    label.createSpan({ cls: "rikka-card-composer-column", text: columnName || "column" });
+    const status = label.createSpan({ cls: "rikka-card-composer-status" });
+    const row = bar.createDiv({ cls: "rikka-card-composer-row" });
+    const input = row.createEl("input", {
+      cls: "rikka-card-composer-input",
+      attr: { type: "text", placeholder: "Card title", enterkeyhint: "send", autocapitalize: "sentences", autocomplete: "off", "aria-label": `New card in ${columnName}` },
+    });
+    const done = row.createEl("button", { cls: "rikka-card-composer-done", text: "Done", attr: { type: "button" } });
+
+    // Keep the bar glued to the top of the keyboard.
+    const vv = window.visualViewport;
+    const place = () => {
+      const keyboard = vv ? Math.max(0, window.innerHeight - (vv.height + vv.offsetTop)) : 0;
+      bar.style.bottom = `${keyboard}px`;
+    };
+    place();
+    vv?.addEventListener("resize", place);
+    vv?.addEventListener("scroll", place);
+
+    let busy = false;
+    let closed = false;
+    let offLayout = null;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      if (offLayout) this.app.workspace.offref(offLayout);
+      vv?.removeEventListener("resize", place);
+      vv?.removeEventListener("scroll", place);
+      input.blur();
+      bar.remove();
+    };
+    const add = async () => {
+      const title = input.value.trim();
+      if (!title || busy) return false;
+      busy = true;
+      this.armNewCardGuard();
+      try {
+        await this.createBoardCard(liveColumn(), title, info);
+        input.value = "";
+        status.setText(" · added");
+        window.setTimeout(() => status.setText(""), 1200);
+        return true;
+      } catch (error) {
+        new Notice(`Could not add card: ${error?.message || error}`);
+        return false;
+      } finally {
+        busy = false;
+      }
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        void add();          // keyboard stays up for the next card
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+      }
+    });
+    // Done: add what's typed (if anything), then close.
+    done.addEventListener("pointerdown", (event) => event.preventDefault()); // keep focus until we're done
+    done.addEventListener("click", async () => {
+      if (input.value.trim()) await add();
+      close();
+    });
+    // Leaving the board (back, switching notes) closes the bar.
+    const leaf = info.leaf;
+    offLayout = this.app.workspace.on("active-leaf-change", (active) => { if (active && active !== leaf) close(); });
+    this.composerCleanup?.();
+    this.composerCleanup = close;
+    input.focus({ preventScroll: true });
   }
 
   startBoardCardInput(column) {
@@ -936,8 +1031,8 @@ module.exports = class RikkaPlugin extends Plugin {
     wrapper.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
-  async createBoardCard(column, title) {
-    const info = await this.getBoardInfo(column);
+  async createBoardCard(column, title, knownInfo = null) {
+    const info = knownInfo || await this.getBoardInfo(column);
     if (!info) throw new Error("Open the board as a page before adding an item.");
     const { baseFile, config, groupProperty } = info;
     const folder = config?.newItemFolder || baseFile.parent?.path || "";
