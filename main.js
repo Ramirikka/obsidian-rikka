@@ -1047,13 +1047,15 @@ class RikkaQA {
       if (!row) return;
       const r = row.getBoundingClientRect();
       row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: r.left + 20, clientY: r.top + 5 }));
-      const menu = await this.waitFor(() => document.querySelector(".menu"), 1500);
-      const titles = Array.from(menu?.querySelectorAll(".menu-item-title") || []).map((t) => t.textContent);
+      // Read the item titles from Rikka's Menu object (works with native macOS menus too).
+      const menu = await this.waitFor(() => this.plugin.lastItemMenu, 1500);
+      const titles = (menu?.items || []).map((i) => i.titleEl?.textContent || i.dom?.textContent || "").map((t) => t.trim());
       for (const t of ["Add", "Duplicate", "Rename…", "Move to Trash", "Label", "Status", "Move To", "Copy To", "Add to Collection", "Put in New Folder…", "Convert to Folder", "Copy Document Link"]) {
         this.check(`Menu has “${t}”`, titles.includes(t), titles.join(" | "));
       }
-      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-      menu?.remove();
+      menu?.hide?.();
+      this.plugin.lastItemMenu = null;
+      await this.wait(200);
       this.check("Add → targets the document's folder", this.plugin.targetForItem(doc, "draft").folder === folder.path);
       await this.plugin.copyItemTo(doc, this.sandbox);
       this.check("Copy To makes a copy, original stays", this.file(`${this.sandbox}/Menu Doc.md`) && this.file(doc.path));
@@ -4251,6 +4253,7 @@ module.exports = class RikkaPlugin extends Plugin {
         else bookmarks.addItem({ type: isFile ? "file" : "folder", path: item.path, title: "" });
       }, "Bookmarks")));
     }
+    this.lastItemMenu = menu;
 
     // --- Less common document tools
     if (isMd) {
