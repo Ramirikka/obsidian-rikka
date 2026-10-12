@@ -2943,17 +2943,21 @@ module.exports = class RikkaPlugin extends Plugin {
   // Settings → General: an "Update Rikka" row right under Obsidian's own
   // version / "Check for updates" row. Only acts when the button is pressed.
   installGeneralUpdateRow() {
+    this.instanceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const addRow = () => {
       const setting = this.app.setting;
       const content = setting?.activeTab?.containerEl;
       if (!content || !content.isConnected) return;
       // General ("about") tab: its first row is Obsidian's version + Check for updates.
       if (setting.activeTab.id !== "about" && !/^Version\s/.test(content.querySelector(".setting-item-name")?.textContent || "")) return;
-      if (!content || content.querySelector(".rikka-general-update")) return;
+      const existing = content.querySelector(".rikka-general-update");
+      if (existing && existing.dataset.instance === this.instanceId) return;
+      existing?.remove(); // left behind by the copy of Rikka that was running before an update
       const first = content.querySelector(".setting-item");
       if (!first) return;
       const row = content.ownerDocument.createElement("div");
       row.className = "setting-item rikka-general-update";
+      row.dataset.instance = this.instanceId;
       const info = row.createDiv({ cls: "setting-item-info" });
       info.createDiv({ cls: "setting-item-name", text: "Rikka" });
       const desc = info.createDiv({ cls: "setting-item-description", text: `Current version: ${this.manifest.version}` });
@@ -3018,21 +3022,44 @@ module.exports = class RikkaPlugin extends Plugin {
     const now = Date.now();
     if (!force && this.lastUpdateCheck && now - this.lastUpdateCheck < 30 * 60 * 1000) return this.availableUpdate;
     this.lastUpdateCheck = now;
+    this.updateCheckError = null;
+    const installed = await this.installedVersion();
     try {
-      const { requestUrl } = require("obsidian");
-      const release = (await requestUrl({ url: "https://api.github.com/repos/Ramirikka/obsidian-rikka/releases/latest", headers: { Accept: "application/vnd.github+json" } })).json;
+      // 1) GitHub's release API (can be rate-limited or slow)…
+      const release = (await this.fetchWithTimeout({ url: "https://api.github.com/repos/Ramirikka/obsidian-rikka/releases/latest", headers: { Accept: "application/vnd.github+json" } })).json;
       const asset = (name) => release?.assets?.find((a) => a.name === name)?.browser_download_url;
       const version = String(release?.tag_name || "").replace(/^v/, "");
-      const installed = await this.installedVersion();
-      const ready = asset("manifest.json") && asset("main.js");
-      this.availableUpdate = ready && this.isNewer(version, installed)
+      if (!version || !asset("manifest.json") || !asset("main.js")) throw new Error("release not ready");
+      this.availableUpdate = this.isNewer(version, installed)
         ? { version, manifest: asset("manifest.json"), main: asset("main.js"), styles: asset("styles.css") }
         : null;
-    } catch (error) {
-      this.lastUpdateCheck = 0;
-      console.warn("Rikka update check failed", error);
+    } catch (apiError) {
+      // 2) …so fall back to the plain "latest release" download links.
+      try {
+        const base = "https://github.com/Ramirikka/obsidian-rikka/releases/latest/download";
+        const remote = (await this.fetchWithTimeout({ url: `${base}/manifest.json` })).json;
+        const version = String(remote?.version || "");
+        if (!version) throw new Error("no version in manifest");
+        this.availableUpdate = this.isNewer(version, installed)
+          ? { version, manifest: `${base}/manifest.json`, main: `${base}/main.js`, styles: `${base}/styles.css` }
+          : null;
+      } catch (error) {
+        this.lastUpdateCheck = 0;
+        this.availableUpdate = null;
+        this.updateCheckError = error?.message || String(error);
+        console.warn("Rikka update check failed", apiError, error);
+      }
     }
     return this.availableUpdate;
+  }
+
+  // requestUrl has no timeout of its own; never let the button hang.
+  fetchWithTimeout(options, ms = 20000) {
+    const { requestUrl } = require("obsidian");
+    return Promise.race([
+      requestUrl(options),
+      new Promise((_, reject) => window.setTimeout(() => reject(new Error("GitHub didn't respond in time")), ms)),
+    ]);
   }
 
   async installUpdate(fromCommand = false) {
@@ -3041,15 +3068,15 @@ module.exports = class RikkaPlugin extends Plugin {
     try {
       const update = await this.findUpdate(true);
       if (!update) {
+        if (this.updateCheckError) throw new Error(`couldn't reach GitHub (${this.updateCheckError}). Check your internet and try again.`);
         if (fromCommand) new Notice(`Rikka is up to date (${await this.installedVersion()}).`);
         return;
       }
-      const { requestUrl } = require("obsidian");
-      const remote = (await requestUrl({ url: update.manifest })).json;
+      const remote = (await this.fetchWithTimeout({ url: update.manifest })).json;
       if (remote?.id !== this.manifest.id || remote.version !== update.version) throw new Error("Release files don't match");
-      const js = (await requestUrl({ url: update.main })).text;
+      const js = (await this.fetchWithTimeout({ url: update.main }, 60000)).text;
       if (!js || js.length < 10000 || !js.includes("RikkaPlugin")) throw new Error("Downloaded update looks incomplete");
-      const css = update.styles ? await requestUrl({ url: update.styles }).then((r) => r.text, () => null) : null;
+      const css = update.styles ? await this.fetchWithTimeout({ url: update.styles }).then((r) => r.text, () => null) : null;
       const dir = this.manifest.dir || `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
       const adapter = this.app.vault.adapter;
       await adapter.write(`${dir}/main.js`, js);
