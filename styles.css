@@ -751,3 +751,22 @@ body.is-mobile .base-board-card { border-radius: var(--radius-m, 8px); }
 .rikka-project-card-new { align-items: center; justify-content: center; flex-direction: row; min-height: 120px; border-style: dashed; background: transparent; color: var(--text-muted); cursor: pointer; box-shadow: none; }
 body.is-phone .rikka-projects-grid { grid-template-columns: 1fr; }
 body.is-mobile .rikka-project-card-actions button { min-width: 40px; min-height: 40px; }
+
+/* Document format bar (desktop) */
+.rikka-format-bar {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 4px 10px; border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary); font-size: var(--font-ui-small);
+}
+.rikka-format-btn { padding: 4px; height: 26px; width: 26px; }
+.rikka-format-select { height: 26px; font-size: var(--font-ui-small); padding: 0 22px 0 8px; max-width: 150px; }
+.rikka-format-select.is-size, .rikka-format-select.is-line { max-width: 92px; }
+.rikka-format-sep { width: 1px; height: 18px; background: var(--background-modifier-border); margin: 0 4px; }
+/* Chosen font / size / spacing for documents */
+body.rikka-doc-look .markdown-source-view.mod-cm6 .cm-scroller,
+body.rikka-doc-look .markdown-preview-view {
+  font-family: var(--rikka-doc-font, var(--font-text));
+  font-size: var(--rikka-doc-size, var(--font-text-size));
+  line-height: var(--rikka-doc-line, var(--line-height-normal));
+}
+body.rikka-doc-look .markdown-source-view.mod-cm6 .cm-line { line-height: var(--rikka-doc-line, var(--line-height-normal)); }

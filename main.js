@@ -1061,6 +1061,31 @@ class RikkaQA {
       this.check("Convert to Folder wraps the document", this.file(`${this.sandbox}/Menu Doc`) instanceof TFolder && this.file(`${this.sandbox}/Menu Doc/Menu Doc.md`));
       this.check("Content kept after convert", (await this.app.vault.read(this.file(`${this.sandbox}/Menu Doc/Menu Doc.md`))) === "hello");
     });
+    await this.step("Document bar: ↑ ↓ move through the Binder, split, format bar", async () => {
+      const a = await this.app.vault.create(`${this.sandbox}/Menu Folder/A first.md`, "a");
+      const b = await this.app.vault.create(`${this.sandbox}/Menu Folder/B second.md`, "b");
+      this.plugin.setContext("draft", `${this.sandbox}/Menu Folder`, { expandFolder: true });
+      await this.waitFor(() => v.containerEl.querySelector(`.rikka-row[data-path="${CSS.escape(b.path)}"]`), 3000);
+      const leaf = this.app.workspace.getLeaf(Platform.isMobile ? false : "tab");
+      await leaf.openFile(a, { active: true });
+      await this.wait(300);
+      const header = leaf.view.containerEl.querySelector(".view-actions");
+      this.check("Header has ↑ ↓ buttons", header?.querySelector('[aria-label="Next document in the Binder"]') && header?.querySelector('[aria-label="Previous document in the Binder"]'));
+      if (mode !== "mobile") this.check("Format bar shown above the document", leaf.view.containerEl.querySelector(":scope > .rikka-format-bar"));
+      await this.plugin.stepDocument(leaf, 1);
+      this.check("↓ opens the next Binder document in the same tab", leaf.view?.file?.path === b.path, leaf.view?.file?.path);
+      await this.plugin.stepDocument(leaf, -1);
+      this.check("↑ goes back", leaf.view?.file?.path === a.path, leaf.view?.file?.path);
+      if (mode !== "mobile") {
+        await this.plugin.toggleSplit(leaf);
+        await this.wait(300);
+        this.check("Split opens a second pane beside it", leaf.parent?.direction === "vertical" && leaf.parent.children.length === 2);
+        await this.plugin.toggleSplit(leaf);
+        await this.wait(300);
+        this.check("Split again goes back to one pane", !(leaf.parent?.direction === "vertical" && leaf.parent.children.length > 1));
+      }
+      leaf.detach();
+    });
   }
 
   async openBoard() {
@@ -2970,6 +2995,155 @@ module.exports = class RikkaPlugin extends Plugin {
     this.addSettingTab(new RikkaSettingTab(this.app, this));
     this.installGeneralUpdateRow();
     this.installNewDocumentShortcut();
+    this.installDocumentBar();
+  }
+
+  // ---- Document bar: Scrivener-style format bar + header buttons ----------
+  // Format bar (desktop): paragraph style, font, size, B/I/U/S/highlight, line
+  // spacing, lists. Font/size/spacing change how documents LOOK (all of them);
+  // the rest edits the Markdown. Header: ↑ ↓ previous/next document in Binder
+  // order, and a split button.
+  installDocumentBar() {
+    this.applyDocumentLook();
+    const { MarkdownView } = require("obsidian");
+    const attach = () => {
+      this.app.workspace.iterateAllLeaves((leaf) => {
+        const view = leaf.view;
+        if (!(view instanceof MarkdownView) || view.__rikkaBar) return;
+        view.__rikkaBar = true;
+        // addAction inserts at the start, so add in reverse visual order.
+        if (!Platform.isPhone) view.addAction("columns-2", "Split: show two documents side by side", () => this.runSafely(() => this.toggleSplit(leaf), "Split"));
+        view.addAction("chevron-down", "Next document in the Binder", () => this.runSafely(() => this.stepDocument(leaf, 1), "Next document"));
+        view.addAction("chevron-up", "Previous document in the Binder", () => this.runSafely(() => this.stepDocument(leaf, -1), "Previous document"));
+        if (!Platform.isMobile) this.buildFormatBar(view);
+      });
+    };
+    this.registerEvent(this.app.workspace.on("layout-change", attach));
+    this.registerEvent(this.app.workspace.on("active-leaf-change", attach));
+    this.app.workspace.onLayoutReady(attach);
+    this.register(() => {
+      document.querySelectorAll(".rikka-format-bar").forEach((el) => el.remove());
+      this.app.workspace.iterateAllLeaves((leaf) => { if (leaf.view) leaf.view.__rikkaBar = false; });
+    });
+  }
+
+  applyDocumentLook() {
+    const look = this.data.documentLook || {};
+    const body = document.body;
+    const set = (name, value) => value ? body.style.setProperty(name, value) : body.style.removeProperty(name);
+    set("--rikka-doc-font", look.font || "");
+    set("--rikka-doc-size", look.size ? `${look.size}px` : "");
+    set("--rikka-doc-line", look.line ? String(look.line) : "");
+    body.toggleClass("rikka-doc-look", Boolean(look.font || look.size || look.line));
+  }
+
+  async setDocumentLook(key, value) {
+    this.data.documentLook = { ...(this.data.documentLook || {}), [key]: value };
+    this.applyDocumentLook();
+    await this.saveData(this.captureAndReturnData());
+    document.querySelectorAll(".rikka-format-bar").forEach((bar) => bar.__rikkaSync?.());
+  }
+
+  buildFormatBar(view) {
+    const host = view.containerEl;
+    if (host.querySelector(":scope > .rikka-format-bar")) return;
+    const bar = createDiv({ cls: "rikka-format-bar" });
+    host.prepend(bar);
+    const editor = () => view.editor;
+    const keepFocus = (el) => el.addEventListener("mousedown", (e) => { if (el.tagName === "BUTTON") e.preventDefault(); });
+    const btn = (icon, label, fn) => {
+      const b = bar.createEl("button", { cls: "rikka-format-btn clickable-icon", attr: { "aria-label": label, title: label } });
+      setIcon(b, icon);
+      keepFocus(b);
+      b.addEventListener("click", () => { try { fn(); } catch (e) { console.error(e); } editor()?.focus(); });
+      return b;
+    };
+    const select = (label, options, onChange, cls = "") => {
+      const el = bar.createEl("select", { cls: `rikka-format-select dropdown ${cls}`, attr: { "aria-label": label, title: label } });
+      for (const [value, text] of options) el.createEl("option", { value, text });
+      el.addEventListener("change", () => { onChange(el.value); editor()?.focus(); });
+      return el;
+    };
+    const sep = () => bar.createDiv({ cls: "rikka-format-sep" });
+    const lineRange = () => { const c = editor().getCursor(); return { from: c, to: c }; };
+
+    // Paragraph style (edits the Markdown line)
+    const style = select("Paragraph style", [["", "¶ Style"], ["text", "Body text"], ["h1", "Heading 1"], ["h2", "Heading 2"], ["h3", "Heading 3"], ["quote", "Quote"]], (v) => {
+      if (v && editor()) this.setLineKind(editor(), lineRange(), v);
+      style.value = "";
+    }, "is-style");
+    sep();
+    // Look of all documents
+    const fonts = [["", "Default font"], ["Menlo, monospace", "Menlo"], ["Georgia, serif", "Georgia"], ["'Times New Roman', Times, serif", "Times"], ["'Helvetica Neue', Helvetica, Arial, sans-serif", "Helvetica"], ["Avenir, 'Avenir Next', sans-serif", "Avenir"], ["Palatino, 'Palatino Linotype', serif", "Palatino"], ["'Courier New', Courier, monospace", "Courier"], ["-apple-system, BlinkMacSystemFont, sans-serif", "System"]];
+    const font = select("Font (all documents)", fonts, (v) => this.runSafely(() => this.setDocumentLook("font", v), "Font"), "is-font");
+    const size = select("Text size (all documents)", [["", "Size"], ...[11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24].map((n) => [String(n), String(n)])], (v) => this.runSafely(() => this.setDocumentLook("size", v ? Number(v) : 0), "Size"), "is-size");
+    sep();
+    btn("bold", "Bold", () => this.app.commands.executeCommandById("editor:toggle-bold"));
+    btn("italic", "Italic", () => this.app.commands.executeCommandById("editor:toggle-italics"));
+    btn("underline", "Underline", () => {
+      const ed = editor(); if (!ed) return;
+      const sel = ed.getSelection();
+      if (/^<u>[\s\S]*<\/u>$/.test(sel)) ed.replaceSelection(sel.slice(3, -4));
+      else if (sel) ed.replaceSelection(`<u>${sel}</u>`);
+      else { const c = ed.getCursor(); ed.replaceRange("<u></u>", c); ed.setCursor({ line: c.line, ch: c.ch + 3 }); }
+    });
+    btn("strikethrough", "Strikethrough", () => this.app.commands.executeCommandById("editor:toggle-strikethrough"));
+    btn("highlighter", "Highlight", () => this.app.commands.executeCommandById("editor:toggle-highlight"));
+    sep();
+    const line = select("Line spacing (all documents)", [["", "↕ Spacing"], ["1.2", "1.2"], ["1.5", "1.5"], ["1.75", "1.75"], ["2", "2.0"]], (v) => this.runSafely(() => this.setDocumentLook("line", v ? Number(v) : 0), "Line spacing"), "is-line");
+    sep();
+    btn("list", "Bulleted list", () => this.app.commands.executeCommandById("editor:toggle-bullet-list"));
+    btn("list-ordered", "Numbered list", () => this.app.commands.executeCommandById("editor:toggle-numbered-list"));
+    btn("list-checks", "Checklist", () => this.app.commands.executeCommandById("editor:toggle-checklist-status"));
+
+    bar.__rikkaSync = () => {
+      const look = this.data.documentLook || {};
+      font.value = look.font || "";
+      size.value = look.size ? String(look.size) : "";
+      line.value = look.line ? String(look.line) : "";
+    };
+    bar.__rikkaSync();
+  }
+
+  // Documents in the order the Binder shows them (falls back to the folder).
+  binderOrder(file) {
+    const rows = Array.from(document.querySelectorAll(".rikka-binder .rikka-row[data-path]"))
+      .map((row) => row.dataset.path)
+      .filter((path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile);
+    if (rows.includes(file.path)) return [...new Set(rows)];
+    const siblings = (file.parent?.children || []).filter((f) => f instanceof TFile && ["md", "canvas", "base"].includes(f.extension));
+    return siblings.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })).map((f) => f.path);
+  }
+
+  async stepDocument(leaf, delta) {
+    const file = leaf.view?.file;
+    if (!file) return;
+    const order = this.binderOrder(file);
+    const next = order[order.indexOf(file.path) + delta];
+    if (!next) { new Notice(delta > 0 ? "This is the last document." : "This is the first document."); return; }
+    const target = this.app.vault.getAbstractFileByPath(next);
+    await leaf.openFile(target, { active: true });
+    this.getView()?.setSelected?.(target.path);
+  }
+
+  // One click: split the editor in two (the other side starts with the same
+  // document — click or drag any Binder document into either side). Click
+  // again to go back to one.
+  async toggleSplit(leaf) {
+    const parent = leaf.parent;
+    const siblings = parent?.children?.filter?.((child) => child !== leaf) || [];
+    const ws = this.app.workspace;
+    if (parent && parent.direction === "vertical" && siblings.length) {
+      for (const other of [...siblings]) {
+        if (other.detach) other.detach();
+      }
+      ws.setActiveLeaf(leaf, { focus: true });
+      return;
+    }
+    const right = ws.createLeafBySplit ? ws.createLeafBySplit(leaf, "vertical") : ws.getLeaf("split", "vertical");
+    if (leaf.view?.file) await right.openFile(leaf.view.file, { active: false });
+    ws.setActiveLeaf(leaf, { focus: true });
+    new Notice("Split view: click or drag a Binder document into either side.");
   }
 
   // Cmd/Ctrl+N: new document in the current Rikka location (Draft if none),
