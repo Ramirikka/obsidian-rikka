@@ -256,20 +256,12 @@ class RikkaBinderView extends ItemView {
     const projectPicker = toolbar.createEl("select", { cls: "rikka-project-picker", attr: { "aria-label": "Active project" } });
     for (const project of this.plugin.projects) projectPicker.createEl("option", { value: project.id, text: project.name });
     projectPicker.createEl("option", { value: "__new_project__", text: "＋ New project…" });
-    projectPicker.createEl("option", { value: "__rename_project__", text: "Rename this project…" });
-    projectPicker.createEl("option", { value: "__all_projects__", text: "All projects…" });
     projectPicker.value = this.plugin.data.activeProject;
-    // Double-click the name to rename it.
-    projectPicker.addEventListener("dblclick", (event) => { event.preventDefault(); this.plugin.promptRenameProject(); });
     projectPicker.addEventListener("change", () => {
       const choice = projectPicker.value;
       if (choice.startsWith("__")) projectPicker.value = this.plugin.data.activeProject;
       if (choice === "__new_project__") {
         this.plugin.promptNewProject();
-      } else if (choice === "__rename_project__") {
-        this.plugin.promptRenameProject();
-      } else if (choice === "__all_projects__") {
-        new RikkaProjectsModal(this.plugin).open();
       } else {
         this.plugin.runSafely(() => this.plugin.selectProject(projectPicker.value), "Switch project");
       }
@@ -3669,9 +3661,11 @@ module.exports = class RikkaPlugin extends Plugin {
     menu.addItem((entry) => entry.setTitle(`New from template in ${info.name}…`).setIcon("files").onClick(() => this.promptNewFromTemplate()));
     menu.addItem((entry) => entry.setTitle("New collection…").setIcon("library").onClick(() => this.promptNewCollection()));
     menu.addSeparator();
-    menu.addItem((entry) => entry.setTitle("All projects…").setIcon("layout-grid").onClick(() => new RikkaProjectsModal(this).open()));
-    menu.addItem((entry) => entry.setTitle(`Rename “${this.activeProject.name}”…`).setIcon("pencil").onClick(() => this.promptRenameProject()));
-    menu.addSeparator();
+    // Phone has no room for the grid button in the toolbar, so it lives here.
+    if (Platform.isMobile) {
+      menu.addItem((entry) => entry.setTitle("All projects…").setIcon("layout-grid").onClick(() => new RikkaProjectsModal(this).open()));
+      menu.addSeparator();
+    }
     menu.addItem((entry) => entry.setTitle("Compile Draft to Markdown").setIcon("scroll-text").onClick(() => this.runSafely(() => this.compileDraft(), "Compile Draft")));
     if (event instanceof MouseEvent) menu.showAtMouseEvent(event);
     else menu.showAtPosition({ x: 0, y: 0 });
