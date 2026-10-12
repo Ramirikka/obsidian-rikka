@@ -2917,8 +2917,10 @@ module.exports = class RikkaPlugin extends Plugin {
   installGeneralUpdateRow() {
     const addRow = () => {
       const setting = this.app.setting;
-      if (!setting?.activeTab || setting.activeTab.id !== "about") return;
-      const content = setting.activeTab.containerEl;
+      const content = setting?.activeTab?.containerEl;
+      if (!content || !content.isConnected) return;
+      // General ("about") tab: its first row is Obsidian's version + Check for updates.
+      if (setting.activeTab.id !== "about" && !/^Version\s/.test(content.querySelector(".setting-item-name")?.textContent || "")) return;
       if (!content || content.querySelector(".rikka-general-update")) return;
       const first = content.querySelector(".setting-item");
       if (!first) return;
@@ -2940,9 +2942,17 @@ module.exports = class RikkaPlugin extends Plugin {
       });
       first.after(row);
     };
-    const observer = new MutationObserver(this.frameThrottle(addRow));
+    // Settings can finish switching tabs after the DOM change we hear about,
+    // so re-check a few times over the next second.
+    let timers = [];
+    const schedule = () => {
+      timers.forEach((t) => window.clearTimeout(t));
+      timers = [0, 100, 300, 700, 1200].map((ms) => window.setTimeout(addRow, ms));
+    };
+    const observer = new MutationObserver(this.frameThrottle(schedule));
     observer.observe(document.body, { childList: true, subtree: true });
-    this.register(() => { observer.disconnect(); document.querySelectorAll(".rikka-general-update").forEach((el) => el.remove()); });
+    this.registerDomEvent(document, "click", schedule, true);
+    this.register(() => { observer.disconnect(); timers.forEach((t) => window.clearTimeout(t)); document.querySelectorAll(".rikka-general-update").forEach((el) => el.remove()); });
   }
 
   // The version actually installed on disk (Obsidian keeps the version it
