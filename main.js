@@ -950,16 +950,20 @@ class RikkaQA {
       await this.wait(250);
     });
 
-    if (mode !== "mobile") await this.step("Cmd/Ctrl+N asks for a document in the current location", async () => {
-      const tabsBefore = this.app.workspace.getLeavesOfType("markdown").length + this.app.workspace.getLeavesOfType("empty").length;
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", metaKey: Platform.isMacOS, ctrlKey: !Platform.isMacOS, bubbles: true, cancelable: true }));
-      const input = await this.waitFor(() => this.q(".rikka-name-modal-input"), 2000);
-      const title = this.q(".rikka-name-modal .modal-title")?.textContent || "";
-      this.check("Cmd+N opens Rikka's New document dialog", input, "no dialog");
-      this.check("Dialog names the current folder", title === `New document in ${this.plugin.contextInfo().name}`, title);
-      this.check("Cmd+N did not open a new tab", this.app.workspace.getLeavesOfType("markdown").length + this.app.workspace.getLeavesOfType("empty").length === tabsBefore);
-      this.q(".rikka-name-modal .modal-close-button")?.click();
-      await this.wait(200);
+    if (mode !== "mobile") await this.step("Cmd/Ctrl+N: new Untitled document here, same tab", async () => {
+      const ws = this.app.workspace;
+      const leaf = ws.getLeaf(false);
+      const tabs = () => { let n = 0; ws.iterateRootLeaves(() => n++); return n; };
+      const before = tabs();
+      this.app.commands.executeCommandById("rikka:new-document-now");
+      const where = this.plugin.resolveCreateTarget().targetPath;
+      const created = await this.waitFor(() => this.file(`${where}/Untitled.md`), 3000);
+      await this.wait(300);
+      this.check("Untitled created in the current location", created, where);
+      this.check("Opened in the same tab", ws.getMostRecentLeaf()?.view?.file?.path === `${where}/Untitled.md` && tabs() === before, `${tabs()} tabs (was ${before})`);
+      const keys = this.app.hotkeyManager?.defaultKeys?.["file-explorer:new-file"] || [];
+      this.check("Obsidian's Cmd+N new-tab note is off", !keys.some((k) => String(k.key).toUpperCase() === "N" && (k.modifiers || []).join() === "Mod"), JSON.stringify(keys));
+      if (created) await this.app.fileManager.trashFile(created);
     });
     await this.step("Duplicate name proposes the next free name", async () => {
       this.tap(v.containerEl.querySelector('[aria-label="New document here"]'));
@@ -2929,16 +2933,63 @@ module.exports = class RikkaPlugin extends Plugin {
   // Untitled note in a new tab). Cmd+T stays "new tab".
   installNewDocumentShortcut() {
     if (Platform.isMobile) return;
-    const handler = (event) => {
-      if (event.key?.toLowerCase() !== "n" || event.shiftKey || event.altKey) return;
-      if (!(Platform.isMacOS ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey)) return;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      if (document.querySelector(".rikka-name-modal")) return; // already asking for a name
-      this.runSafely(() => this.promptNewNote(), "New document");
+    // Cmd/Ctrl+N belongs to Rikka: take it off Obsidian's "Create new note"
+    // (which opens a new tab) and give it to Rikka's own command.
+    this.addCommand({
+      id: "new-document-now",
+      name: "New document here (in this tab)",
+      icon: "file-plus-2",
+      hotkeys: [{ modifiers: ["Mod"], key: "N" }],
+      callback: () => this.runSafely(() => this.newDocumentNow(), "New document"),
+    });
+    const hm = this.app.hotkeyManager;
+    const ids = ["file-explorer:new-file", "file-explorer:new-file-in-new-pane"];
+    const saved = {};
+    const strip = () => {
+      for (const id of ids) {
+        const keys = hm?.defaultKeys?.[id];
+        if (!Array.isArray(keys)) continue;
+        const keep = keys.filter((k) => !(String(k.key).toUpperCase() === "N" && (k.modifiers || []).join() === "Mod"));
+        if (keep.length !== keys.length) { saved[id] = keys; hm.defaultKeys[id] = keep; }
+      }
+      hm?.bake?.();
     };
-    this.registerDomEvent(window, "keydown", handler, true);
+    this.app.workspace.onLayoutReady(strip);
+    this.register(() => {
+      for (const [id, keys] of Object.entries(saved)) if (hm?.defaultKeys) hm.defaultKeys[id] = keys;
+      hm?.bake?.();
+    });
   }
+
+  // Create "Untitled" in the current Rikka location (Draft by default), open
+  // it in the tab you're in and put the cursor on the title to name it.
+  async newDocumentNow() {
+    const info = this.resolveCreateTarget();
+    if (!(this.app.vault.getAbstractFileByPath(info.targetPath) instanceof TFolder)) {
+      new Notice(`The folder “${info.path}” no longer exists.`);
+      return;
+    }
+    const path = this.availablePath(info.targetPath, "Untitled", "md");
+    const file = await this.app.vault.create(path, "");
+    await this.registerInSection(info, file.path);
+    if (info.folder) this.data.collapsed[`folder:${info.section}:${info.folder}`] = false;
+    await this.saveState();
+    if (this.getView()) this.getView().selectedPath = file.path;
+    await this.openFile(file);
+    const view = this.app.workspace.getActiveViewOfType?.(require("obsidian").MarkdownView);
+    const title = view?.inlineTitleEl;
+    if (title) {
+      title.focus();
+      const range = document.createRange();
+      range.selectNodeContents(title);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    } else {
+      view?.editor?.focus();
+    }
+  }
+
 
   // Settings → General: an "Update Rikka" row right under Obsidian's own
   // version / "Check for updates" row. Only acts when the button is pressed.
