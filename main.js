@@ -950,6 +950,17 @@ class RikkaQA {
       await this.wait(250);
     });
 
+    if (mode !== "mobile") await this.step("Cmd/Ctrl+N asks for a document in the current location", async () => {
+      const tabsBefore = this.app.workspace.getLeavesOfType("markdown").length + this.app.workspace.getLeavesOfType("empty").length;
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "n", metaKey: Platform.isMacOS, ctrlKey: !Platform.isMacOS, bubbles: true, cancelable: true }));
+      const input = await this.waitFor(() => this.q(".rikka-name-modal-input"), 2000);
+      const title = this.q(".rikka-name-modal .modal-title")?.textContent || "";
+      this.check("Cmd+N opens Rikka's New document dialog", input, "no dialog");
+      this.check("Dialog names the current folder", title === `New document in ${this.plugin.contextInfo().name}`, title);
+      this.check("Cmd+N did not open a new tab", this.app.workspace.getLeavesOfType("markdown").length + this.app.workspace.getLeavesOfType("empty").length === tabsBefore);
+      this.q(".rikka-name-modal .modal-close-button")?.click();
+      await this.wait(200);
+    });
     await this.step("Duplicate name proposes the next free name", async () => {
       this.tap(v.containerEl.querySelector('[aria-label="New document here"]'));
       const input = await this.waitFor(() => this.q(".rikka-name-modal-input"));
@@ -2910,6 +2921,23 @@ module.exports = class RikkaPlugin extends Plugin {
     this.addCommand({ id: "update-rikka", name: "Update Rikka", icon: "download", callback: () => this.installUpdate(true) });
     this.addSettingTab(new RikkaSettingTab(this.app, this));
     this.installGeneralUpdateRow();
+    this.installNewDocumentShortcut();
+  }
+
+  // Cmd/Ctrl+N: new document in the current Rikka location (Draft if none),
+  // opened in the tab you're in. Replaces Obsidian's default (which opens an
+  // Untitled note in a new tab). Cmd+T stays "new tab".
+  installNewDocumentShortcut() {
+    if (Platform.isMobile) return;
+    const handler = (event) => {
+      if (event.key?.toLowerCase() !== "n" || event.shiftKey || event.altKey) return;
+      if (!(Platform.isMacOS ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (document.querySelector(".rikka-name-modal")) return; // already asking for a name
+      this.runSafely(() => this.promptNewNote(), "New document");
+    };
+    this.registerDomEvent(window, "keydown", handler, true);
   }
 
   // Settings → General: an "Update Rikka" row right under Obsidian's own
