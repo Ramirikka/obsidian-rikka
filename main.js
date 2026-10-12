@@ -2924,7 +2924,8 @@ module.exports = class RikkaPlugin extends Plugin {
       if (!content || content.querySelector(".rikka-general-update")) return;
       const first = content.querySelector(".setting-item");
       if (!first) return;
-      const row = createDiv({ cls: "setting-item rikka-general-update" });
+      const row = content.ownerDocument.createElement("div");
+      row.className = "setting-item rikka-general-update";
       const info = row.createDiv({ cls: "setting-item-info" });
       info.createDiv({ cls: "setting-item-name", text: "Rikka" });
       const desc = info.createDiv({ cls: "setting-item-description", text: `Current version: ${this.manifest.version}` });
@@ -2954,8 +2955,15 @@ module.exports = class RikkaPlugin extends Plugin {
     this.registerDomEvent(document, "click", schedule, true);
     // Safety net: a cheap check while the app runs (does nothing unless the
     // General settings page is open and missing the row).
-    this.registerInterval(window.setInterval(() => { if (document.querySelector(".modal.mod-settings")) addRow(); }, 400));
-    this.register(() => { observer.disconnect(); timers.forEach((t) => window.clearTimeout(t)); document.querySelectorAll(".rikka-general-update").forEach((el) => el.remove()); });
+    // Settings may open in its own window (a different document), so check
+    // Obsidian's settings object directly rather than the main window's DOM.
+    this.registerInterval(window.setInterval(addRow, 500));
+    this.register(() => {
+      observer.disconnect();
+      timers.forEach((t) => window.clearTimeout(t));
+      document.querySelectorAll(".rikka-general-update").forEach((el) => el.remove());
+      this.app.setting?.activeTab?.containerEl?.querySelectorAll?.(".rikka-general-update").forEach((el) => el.remove());
+    });
   }
 
   // The version actually installed on disk (Obsidian keeps the version it
