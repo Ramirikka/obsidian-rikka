@@ -1054,8 +1054,10 @@ class RikkaQA {
         this.check(`Menu has “${t}”`, titles.includes(t), titles.join(" | "));
       }
       menu?.hide?.();
+      menu?.close?.();
       this.plugin.lastItemMenu = null;
       await this.wait(200);
+      document.querySelectorAll(".menu").forEach((el) => el.remove());
       this.check("Add → targets the document's folder", this.plugin.targetForItem(doc, "draft").folder === folder.path);
       await this.plugin.copyItemTo(doc, this.sandbox);
       this.check("Copy To makes a copy, original stays", this.file(`${this.sandbox}/Menu Doc.md`) && this.file(doc.path));
@@ -1086,8 +1088,8 @@ class RikkaQA {
         await this.plugin.toggleSplit(leaf);
         await this.wait(300);
         this.check("Split again goes back to one pane", (split()?.children?.length || 1) === 1, `${split()?.children?.length}`);
+        leaf.detach();
       }
-      leaf.detach();
     });
   }
 
