@@ -2952,6 +2952,9 @@ module.exports = class RikkaPlugin extends Plugin {
     const observer = new MutationObserver(this.frameThrottle(schedule));
     observer.observe(document.body, { childList: true, subtree: true });
     this.registerDomEvent(document, "click", schedule, true);
+    // Safety net: a cheap check while the app runs (does nothing unless the
+    // General settings page is open and missing the row).
+    this.registerInterval(window.setInterval(() => { if (document.querySelector(".modal.mod-settings")) addRow(); }, 400));
     this.register(() => { observer.disconnect(); timers.forEach((t) => window.clearTimeout(t)); document.querySelectorAll(".rikka-general-update").forEach((el) => el.remove()); });
   }
 
