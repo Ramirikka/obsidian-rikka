@@ -1079,10 +1079,11 @@ class RikkaQA {
       if (mode !== "mobile") {
         await this.plugin.toggleSplit(leaf);
         await this.wait(300);
-        this.check("Split opens a second pane beside it", leaf.parent?.direction === "vertical" && leaf.parent.children.length === 2);
+        const split = () => leaf.parent?.parent;
+        this.check("Split opens a second pane beside it", split()?.direction === "vertical" && split().children.length === 2, `${split()?.direction} ${split()?.children?.length}`);
         await this.plugin.toggleSplit(leaf);
         await this.wait(300);
-        this.check("Split again goes back to one pane", !(leaf.parent?.direction === "vertical" && leaf.parent.children.length > 1));
+        this.check("Split again goes back to one pane", (split()?.children?.length || 1) === 1, `${split()?.children?.length}`);
       }
       leaf.detach();
     });
@@ -3130,12 +3131,14 @@ module.exports = class RikkaPlugin extends Plugin {
   // document — click or drag any Binder document into either side). Click
   // again to go back to one.
   async toggleSplit(leaf) {
-    const parent = leaf.parent;
-    const siblings = parent?.children?.filter?.((child) => child !== leaf) || [];
     const ws = this.app.workspace;
-    if (parent && parent.direction === "vertical" && siblings.length) {
-      for (const other of [...siblings]) {
-        if (other.detach) other.detach();
+    const group = leaf.parent;                 // the tab group holding this document
+    const split = group?.parent;               // the split holding tab groups
+    const others = (split?.children || []).filter((child) => child !== group && child !== leaf);
+    if (split && split.direction === "vertical" && others.length) {
+      for (const other of others) {
+        const leaves = other.children ? [...other.children] : [other];
+        for (const l of leaves) l.detach?.();
       }
       ws.setActiveLeaf(leaf, { focus: true });
       return;
