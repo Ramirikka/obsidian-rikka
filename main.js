@@ -284,6 +284,18 @@ class RikkaBinderView extends ItemView {
     void this.plugin.renderDraftWordCount(wordCount);
 
     const scroll = root.createDiv({ cls: "rikka-scroll" });
+    // Right-click on empty space: create in the current location.
+    scroll.addEventListener("contextmenu", (event) => {
+      if (event.defaultPrevented || event.target.closest(".rikka-row, .rikka-section-heading, .rikka-collection-heading")) return;
+      event.preventDefault();
+      const where = this.plugin.contextInfo();
+      const menu = new Menu();
+      menu.addItem((entry) => entry.setTitle(`New document in ${where.name}`).setIcon("file-plus-2").onClick(() => this.plugin.promptNewNote()));
+      menu.addItem((entry) => entry.setTitle(`New folder in ${where.name}`).setIcon("folder-plus").onClick(() => this.plugin.promptNewFolder()));
+      menu.addItem((entry) => entry.setTitle("New from template…").setIcon("files").onClick(() => this.plugin.promptNewFromTemplate()));
+      menu.addItem((entry) => entry.setTitle("New collection…").setIcon("library").onClick(() => this.plugin.promptNewCollection()));
+      menu.showAtMouseEvent(event);
+    });
     const draftItems = this.plugin.getDraftItems();
     const draftEmpty = this.plugin.projectRoot instanceof TFolder
       ? "No documents yet. Right-click (or long-press) here to add one."
@@ -388,6 +400,10 @@ class RikkaBinderView extends ItemView {
       const menu = new Menu();
       menu.addItem((entry) => entry.setTitle(`New document in ${label}`).setIcon("file-plus-2").onClick(() => this.plugin.promptNewNote({ section: key, folder: "" })));
       menu.addItem((entry) => entry.setTitle(`New folder in ${label}`).setIcon("folder-plus").onClick(() => this.plugin.promptNewFolder({ section: key, folder: "" })));
+      menu.addItem((entry) => entry.setTitle("New from template…").setIcon("files").onClick(() => this.plugin.promptNewFromTemplate({ section: key, folder: "" })));
+      menu.addSeparator();
+      const collapsedNow = Boolean(this.plugin.data.collapsed[`section:${key}`]);
+      menu.addItem((entry) => entry.setTitle(collapsedNow ? `Expand ${label}` : `Collapse ${label}`).setIcon(collapsedNow ? "chevrons-up-down" : "chevrons-down-up").onClick(() => this.plugin.runSafely(() => this.plugin.toggleCollapsed(`section:${key}`), "Toggle")));
       menu.showAtMouseEvent(event);
     });
 
@@ -887,6 +903,7 @@ class RikkaQA {
     try {
       await this.contextFlows(mode);
       await this.fileFlows(mode);
+      await this.binderMenuFlows(mode);
       await this.boardFlows(mode);
       await this.editorFlows(mode);
       await this.kanbanAudit(mode);
@@ -1016,6 +1033,33 @@ class RikkaQA {
       await this.app.fileManager.trashFile(this.file(`${this.sandbox}/Rivals`));
       await this.waitFor(() => this.plugin.data.context.folder === this.sandbox);
       this.check("Deleted current folder falls back to parent", this.plugin.data.context.folder === this.sandbox, this.plugin.data.context.folder);
+    });
+  }
+
+  async binderMenuFlows(mode) {
+    const v = this.view();
+    await this.step("Binder right-click menu: full Scrivener-style menu", async () => {
+      const folder = await this.app.vault.createFolder(`${this.sandbox}/Menu Folder`);
+      const doc = await this.app.vault.create(`${this.sandbox}/Menu Folder/Menu Doc.md`, "hello");
+      this.plugin.setContext("draft", folder.path, { expandFolder: true });
+      const row = await this.waitFor(() => v.containerEl.querySelector(`.rikka-row[data-path="${CSS.escape(doc.path)}"]`), 3000);
+      this.check("Document row rendered", row);
+      if (!row) return;
+      const r = row.getBoundingClientRect();
+      row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: r.left + 20, clientY: r.top + 5 }));
+      const menu = await this.waitFor(() => document.querySelector(".menu"), 1500);
+      const titles = Array.from(menu?.querySelectorAll(".menu-item-title") || []).map((t) => t.textContent);
+      for (const t of ["Add", "Duplicate", "Rename…", "Move to Trash", "Label", "Status", "Move To", "Copy To", "Add to Collection", "Put in New Folder…", "Convert to Folder", "Copy Document Link"]) {
+        this.check(`Menu has “${t}”`, titles.includes(t), titles.join(" | "));
+      }
+      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      menu?.remove();
+      this.check("Add → targets the document's folder", this.plugin.targetForItem(doc, "draft").folder === folder.path);
+      await this.plugin.copyItemTo(doc, this.sandbox);
+      this.check("Copy To makes a copy, original stays", this.file(`${this.sandbox}/Menu Doc.md`) && this.file(doc.path));
+      await this.plugin.convertToFolder(this.file(`${this.sandbox}/Menu Doc.md`));
+      this.check("Convert to Folder wraps the document", this.file(`${this.sandbox}/Menu Doc`) instanceof TFolder && this.file(`${this.sandbox}/Menu Doc/Menu Doc.md`));
+      this.check("Content kept after convert", (await this.app.vault.read(this.file(`${this.sandbox}/Menu Doc/Menu Doc.md`))) === "hello");
     });
   }
 
@@ -2832,7 +2876,7 @@ module.exports = class RikkaPlugin extends Plugin {
     void words; // total draft word count is intentionally not shown
   }
 
-  promptNewFromTemplate() {
+  promptNewFromTemplate(target) {
     const templates = (this.data.templates || [])
       .map((path) => this.app.vault.getAbstractFileByPath(path))
       .filter((file) => file instanceof TFile);
@@ -2840,7 +2884,7 @@ module.exports = class RikkaPlugin extends Plugin {
       new Notice("Right-click a document and choose Save as template first.");
       return;
     }
-    const info = this.resolveCreateTarget();
+    const info = this.resolveCreateTarget(target);
     const choices = templates.map((file) => ({ value: file.path, label: file.basename }));
     new RikkaChoiceModal(this.app, `Template for a new document in ${info.name}`, choices, async (path) => {
       const template = this.app.vault.getAbstractFileByPath(path);
@@ -3881,48 +3925,245 @@ module.exports = class RikkaPlugin extends Plugin {
     await this.saveState();
   }
 
-  // Short, contextual menus. Folder: create inside / rename / move / trash.
-  // Document: open / rename / move / duplicate / details… / trash.
+  // Where "Add" from a Binder item puts things: inside a folder, or next to a document.
+  targetForItem(item, section) {
+    const sec = section && section !== "trash" ? section : "draft";
+    if (item instanceof TFolder) return { section: sec, folder: item.path };
+    const parent = item.parent?.path;
+    const usable = parent && parent !== "/" && parent !== this.activeProject.path && this.isInActiveProject(parent);
+    return { section: sec, folder: usable ? parent : "" };
+  }
+
+  // Scrivener-style Binder menu: grouped, with submenus (falls back to a
+  // second menu where submenus aren't supported, e.g. older mobile builds).
   showItemMenu(item, section, event) {
     const menu = new Menu();
     const safe = (action, label) => () => this.runSafely(action, label);
     const isFile = item instanceof TFile;
+    const isMd = isFile && item.extension === "md";
     const point = { x: event.clientX, y: event.clientY };
+    const name = isFile ? item.basename : item.name;
+    const sub = (entry, title, icon, build) => {
+      entry.setTitle(title).setIcon(icon);
+      const submenu = typeof entry.setSubmenu === "function" ? entry.setSubmenu() : null;
+      if (submenu) build(submenu);
+      else entry.onClick(() => window.setTimeout(() => { const m = new Menu(); build(m); m.showAtPosition(point); }, 50));
+    };
 
     if (section === "trash") {
       menu.addItem((entry) => entry.setTitle("Restore").setIcon("rotate-ccw").onClick(safe(() => this.moveToCollection(item.path, "draft"), "Restore")));
+      if (isFile) menu.addItem((entry) => entry.setTitle("Open").setIcon("file").onClick(safe(() => this.openFile(item), "Open")));
       menu.showAtMouseEvent(event);
       return;
     }
 
-    if (isFile) {
-      menu.addItem((entry) => entry.setTitle("Open").setIcon("file").onClick(safe(() => { this.getView()?.setSelected(item.path); this.setContextFromItem(item, section); return this.openFile(item); }, "Open")));
-      if (!Platform.isMobile) menu.addItem((entry) => entry.setTitle("Open in new tab").setIcon("file-plus-2").onClick(safe(() => this.openFile(item, true), "Open in new tab")));
-    } else {
-      const here = { section, folder: item.path };
-      menu.addItem((entry) => entry.setTitle("New document").setIcon("file-plus-2").onClick(() => this.promptNewNote(here)));
-      menu.addItem((entry) => entry.setTitle("New folder").setIcon("folder-plus").onClick(() => this.promptNewFolder(here)));
-    }
-    menu.addSeparator();
+    const here = this.targetForItem(item, section);
+    const hereName = this.contextInfo(here).name;
+
+    // --- Add / Duplicate / Trash
+    menu.addItem((entry) => sub(entry, "Add", "plus", (m) => {
+      m.addItem((e) => e.setTitle(`New document in ${hereName}`).setIcon("file-plus-2").onClick(() => this.promptNewNote(here)));
+      m.addItem((e) => e.setTitle(`New folder in ${hereName}`).setIcon("folder-plus").onClick(() => this.promptNewFolder(here)));
+      m.addItem((e) => e.setTitle("New from template…").setIcon("files").onClick(() => this.promptNewFromTemplate(here)));
+    }));
+    if (isFile) menu.addItem((entry) => entry.setTitle("Duplicate").setIcon("copy").onClick(safe(() => this.duplicateFile(item), "Duplicate")));
     menu.addItem((entry) => entry.setTitle("Rename…").setIcon("pencil").onClick(() => this.promptRename(item)));
-    menu.addItem((entry) => entry.setTitle("Move…").setIcon("folder-input").onClick(() => this.promptMoveToFolder(item, section)));
-    if (isFile) {
-      menu.addItem((entry) => entry.setTitle("Duplicate").setIcon("copy").onClick(safe(() => this.duplicateFile(item), "Duplicate")));
-      menu.addItem((entry) => entry.setTitle("Details…").setIcon("sliders-horizontal").onClick(() => {
-        // Opened after this menu closes, at the same spot.
-        window.setTimeout(() => this.showDetailsMenu(item, section, point), 50);
-      }));
-    }
-    menu.addSeparator();
-    if (section.startsWith("collection:")) {
-      const name = section.slice("collection:".length);
-      menu.addItem((entry) => entry.setTitle("Remove from collection").setIcon("list-minus").onClick(safe(() => this.removeFromCollection(name, item.path), "Remove from collection")));
-    }
-    menu.addItem((entry) => entry.setTitle("Move to Trash").setIcon("trash-2").setWarning(true).onClick(safe(async () => {
+    menu.addItem((entry) => entry.setTitle("Move to Trash").setIcon("trash-2").onClick(safe(async () => {
       await this.moveToCollection(item.path, "trash");
       new Notice(`Moved “${item.name}” to Trash. Restore it from Trash in the Binder.`);
     }, "Move to Trash")));
+    menu.addSeparator();
+
+    // --- Label / Status / Icon / Synopsis (documents)
+    if (isMd) {
+      const fm = this.app.metadataCache.getFileCache(item)?.frontmatter || {};
+      menu.addItem((entry) => sub(entry, "Label", "paintbrush", (m) => {
+        m.addItem((e) => e.setTitle("No label").setChecked(!fm.rikka_label).onClick(safe(() => this.setFileProperty(item, "rikka_label", ""), "Label")));
+        for (const label of Object.keys(RIKKA_LABELS)) {
+          m.addItem((e) => {
+            e.setTitle(label).setChecked(fm.rikka_label === label).onClick(safe(() => this.setFileProperty(item, "rikka_label", label), "Label"));
+            e.setIcon("circle");
+            const icon = e.dom?.querySelector?.(".menu-item-icon svg");
+            if (icon) { icon.style.color = RIKKA_LABELS[label]; icon.style.fill = RIKKA_LABELS[label]; }
+          });
+        }
+      }));
+      menu.addItem((entry) => sub(entry, "Status", "badge-check", (m) => {
+        m.addItem((e) => e.setTitle("No status").setChecked(!fm.rikka_status).onClick(safe(() => this.setFileProperty(item, "rikka_status", ""), "Status")));
+        for (const status of ["To Do", "First Draft", "Revised Draft", "Final Draft", "Done", "Needs work"]) {
+          m.addItem((e) => e.setTitle(status).setChecked(fm.rikka_status === status).onClick(safe(() => this.setFileProperty(item, "rikka_status", status), "Status")));
+        }
+      }));
+      menu.addItem((entry) => sub(entry, "Change Icon", "star", (m) => {
+        m.addItem((e) => e.setTitle("Default").setChecked(!fm.rikka_icon).onClick(safe(() => this.setFileProperty(item, "rikka_icon", ""), "Icon")));
+        for (const icon of RIKKA_ICONS) m.addItem((e) => e.setTitle(icon.replace(/-/g, " ")).setIcon(icon).setChecked(fm.rikka_icon === icon).onClick(safe(() => this.setFileProperty(item, "rikka_icon", icon), "Icon")));
+      }));
+      menu.addItem((entry) => entry.setTitle("Synopsis…").setIcon("align-left").onClick(() => {
+        new RikkaTextModal(this.app, `Synopsis · ${item.basename}`, fm.rikka_synopsis || "", (value) => this.setFileProperty(item, "rikka_synopsis", value)).open();
+      }));
+      menu.addSeparator();
+    }
+
+    // --- Move / Copy / Collections
+    menu.addItem((entry) => sub(entry, "Move To", "folder-input", (m) => {
+      m.addItem((e) => e.setTitle("Draft (top level)").onClick(safe(async () => {
+        await this.moveToCollection(item.path, "draft");
+        await this.moveIntoFolder(item.path, this.projectRoot);
+      }, "Move")));
+      m.addItem((e) => e.setTitle("Research").onClick(safe(() => this.moveToCollection(item.path, "research"), "Move")));
+      m.addSeparator();
+      m.addItem((e) => e.setTitle("Choose folder…").setIcon("folder-search").onClick(() => this.promptMoveToFolder(item, section)));
+    }));
+    menu.addItem((entry) => sub(entry, "Copy To", "copy-plus", (m) => {
+      m.addItem((e) => e.setTitle("Choose folder…").setIcon("folder-search").onClick(() => this.promptCopyToFolder(item)));
+      const others = this.projects.filter((p) => p.id !== this.data.activeProject);
+      if (others.length) m.addSeparator();
+      for (const project of others) {
+        m.addItem((e) => e.setTitle(`Project: ${project.name}`).setIcon("library").onClick(safe(() => this.copyItemTo(item, project.path, `“${project.name}”`), "Copy to project")));
+      }
+    }));
+    menu.addItem((entry) => sub(entry, "Add to Collection", "library", (m) => {
+      for (const cname of Object.keys(this.data.collections || {}).sort((a, b) => a.localeCompare(b))) {
+        const has = (this.data.collections[cname] || []).includes(item.path);
+        m.addItem((e) => e.setTitle(cname).setChecked(has).onClick(safe(async () => {
+          const paths = this.data.collections[cname] || [];
+          this.data.collections[cname] = has ? paths.filter((p) => p !== item.path) : [...paths, item.path];
+          await this.saveState();
+        }, "Collection")));
+      }
+      m.addItem((e) => e.setTitle("New collection…").setIcon("plus").onClick(() => this.promptNewCollection(item)));
+    }));
+    if (section.startsWith("collection:")) {
+      const cname = section.slice("collection:".length);
+      menu.addItem((entry) => entry.setTitle("Remove from this collection").setIcon("list-minus").onClick(safe(() => this.removeFromCollection(cname, item.path), "Remove from collection")));
+    }
+    menu.addSeparator();
+
+    // --- Structure
+    menu.addItem((entry) => entry.setTitle("Put in New Folder…").setIcon("folder-plus").onClick(() => this.promptPutInNewFolder(item, section)));
+    if (isFile) menu.addItem((entry) => entry.setTitle("Convert to Folder").setIcon("folder").onClick(safe(() => this.convertToFolder(item), "Convert to folder")));
+    menu.addSeparator();
+
+    // --- Open / Reveal
+    if (isFile) {
+      menu.addItem((entry) => sub(entry, "Open", "file", (m) => {
+        m.addItem((e) => e.setTitle("In this tab").onClick(safe(() => { this.getView()?.setSelected(item.path); this.setContextFromItem(item, section); return this.openFile(item); }, "Open")));
+        if (!Platform.isMobile) {
+          m.addItem((e) => e.setTitle("In new tab").onClick(safe(() => this.openFile(item, true), "Open")));
+          m.addItem((e) => e.setTitle("To the right").onClick(safe(() => this.openFile(item, false, true), "Open")));
+          m.addItem((e) => e.setTitle("In new window").onClick(safe(() => this.app.workspace.getLeaf("window").openFile(item), "Open")));
+        }
+      }));
+    }
+    const explorer = this.app.internalPlugins?.getPluginById?.("file-explorer")?.instance;
+    if (explorer?.revealInFolder) menu.addItem((entry) => entry.setTitle("Reveal in File Explorer").setIcon("folder-tree").onClick(() => explorer.revealInFolder(item)));
+    if (!Platform.isMobile) menu.addItem((entry) => entry.setTitle(Platform.isMacOS ? "Show in Finder" : "Show in system explorer").setIcon("external-link").onClick(() => this.app.showInFolder?.(item.path)));
+    menu.addSeparator();
+
+    // --- Links & bookmarks
+    if (isFile) menu.addItem((entry) => entry.setTitle("Copy Document Link").setIcon("link").onClick(safe(async () => {
+      await navigator.clipboard.writeText(this.app.fileManager.generateMarkdownLink(item, ""));
+      new Notice("Link copied.");
+    }, "Copy link")));
+    const bookmarks = this.app.internalPlugins?.getPluginById?.("bookmarks")?.instance;
+    if (bookmarks?.addItem) {
+      const find = (items) => { for (const b of items || []) { if (b.path === item.path) return b; const f = find(b.items); if (f) return f; } return null; };
+      const existing = find(bookmarks.items);
+      menu.addItem((entry) => entry.setTitle(existing ? "Remove from Bookmarks" : "Add to Bookmarks").setIcon(existing ? "bookmark-minus" : "bookmark-plus").onClick(safe(async () => {
+        if (existing) bookmarks.removeItem(existing);
+        else bookmarks.addItem({ type: isFile ? "file" : "folder", path: item.path, title: "" });
+      }, "Bookmarks")));
+    }
+
+    // --- Less common document tools
+    if (isMd) {
+      menu.addItem((entry) => sub(entry, "More", "more-horizontal", (m) => {
+        const fm = this.app.metadataCache.getFileCache(item)?.frontmatter || {};
+        const included = fm.rikka_include !== false;
+        m.addItem((e) => e.setTitle(included ? "Exclude from compile" : "Include in compile").setIcon(included ? "circle-minus" : "circle-check").onClick(safe(() => this.setFileProperty(item, "rikka_include", included ? false : true), "Compile setting")));
+        const isTemplate = (this.data.templates || []).includes(item.path);
+        m.addItem((e) => e.setTitle(isTemplate ? "Remove from templates" : "Save as template").setIcon("files").onClick(safe(async () => {
+          this.data.templates ||= [];
+          this.data.templates = isTemplate ? this.data.templates.filter((p) => p !== item.path) : [...this.data.templates, item.path];
+          await this.saveState();
+          new Notice(isTemplate ? "Removed from templates." : "Saved as a template.");
+        }, "Template")));
+        m.addItem((e) => e.setTitle("Take snapshot").setIcon("history").onClick(safe(() => this.takeSnapshot(item), "Take snapshot")));
+        m.addItem((e) => e.setTitle("Compare with latest snapshot").setIcon("git-compare").onClick(safe(() => this.openLatestSnapshotBeside(item), "Compare")));
+        m.addItem((e) => e.setTitle("Clear status & label").setIcon("eraser").onClick(safe(() => this.clearRikkaLabels(item), "Clear")));
+      }));
+    }
     menu.showAtMouseEvent(event);
+  }
+
+  promptCopyToFolder(item) {
+    const root = this.projectRoot;
+    if (!(root instanceof TFolder)) return;
+    const choices = [{ value: root.path, label: "Draft (top level)" }];
+    const walk = (folder) => {
+      for (const child of [...folder.children].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))) {
+        if (!(child instanceof TFolder) || child.name === "_Rikka") continue;
+        if (item instanceof TFolder && this.pathIsWithin(child.path, item.path)) continue;
+        choices.push({ value: child.path, label: this.contextInfo({ section: "draft", folder: child.path }).path });
+        walk(child);
+      }
+    };
+    walk(root);
+    new RikkaChoiceModal(this.app, `Copy “${item.name}” to…`, choices, (path) => this.runSafely(() => this.copyItemTo(item, path), "Copy")).open();
+  }
+
+  // Copy a document (or a whole folder) into another folder; never overwrites.
+  async copyItemTo(item, folderPath, label) {
+    const dest = this.app.vault.getAbstractFileByPath(folderPath);
+    if (!(dest instanceof TFolder)) throw new Error("That folder no longer exists.");
+    const copyInto = async (src, parentPath) => {
+      if (src instanceof TFile) {
+        const base = src.basename;
+        let path = `${parentPath}/${base}.${src.extension}`;
+        for (let n = 2; this.app.vault.getAbstractFileByPath(path); n++) path = `${parentPath}/${base} ${n}.${src.extension}`;
+        return this.app.vault.copy(src, path);
+      }
+      let path = `${parentPath}/${src.name}`;
+      for (let n = 2; this.app.vault.getAbstractFileByPath(path); n++) path = `${parentPath}/${src.name} ${n}`;
+      await this.app.vault.createFolder(path);
+      for (const child of src.children) await copyInto(child, path);
+    };
+    await copyInto(item, dest.path);
+    new Notice(`Copied “${item.name}” to ${label || this.contextInfo({ section: "draft", folder: dest.path === this.activeProject.path ? "" : dest.path }).path}.`);
+  }
+
+  promptPutInNewFolder(item, section) {
+    const parent = item.parent;
+    if (!(parent instanceof TFolder)) return;
+    new RikkaNameModal(this.app, `Put “${item.name}” in a new folder`, "Folder name", async (name) => {
+      const safe = this.safeName(name);
+      if (!safe) return;
+      const path = `${parent.path === "/" ? "" : parent.path + "/"}${safe}`;
+      if (this.app.vault.getAbstractFileByPath(path)) return `${safe} 2`;
+      const folder = await this.app.vault.createFolder(path);
+      const wasResearch = this.data.research.includes(item.path);
+      await this.moveIntoFolder(item.path, folder);
+      if (wasResearch) { await this.moveToCollection(item.path, "draft"); await this.moveToCollection(folder.path, "research"); }
+      this.data.collapsed[`folder:${section}:${folder.path}`] = false;
+      await this.saveState();
+    }, { buttonText: "Create folder", subtitle: this.contextInfo(this.targetForItem(item, section)).path }).open();
+  }
+
+  // Scrivener's "Convert to Folder": a folder with the document's name that
+  // holds the document, so you can add sub-documents under it.
+  async convertToFolder(file) {
+    const parent = file.parent;
+    if (!(parent instanceof TFolder)) return;
+    const prefix = parent.path === "/" ? "" : `${parent.path}/`;
+    let path = `${prefix}${file.basename}`;
+    for (let n = 2; this.app.vault.getAbstractFileByPath(path); n++) path = `${prefix}${file.basename} ${n}`;
+    const folder = await this.app.vault.createFolder(path);
+    const wasResearch = this.data.research.includes(file.path);
+    await this.moveIntoFolder(file.path, folder);
+    if (wasResearch) { await this.moveToCollection(`${folder.path}/${file.name}`, "draft"); await this.moveToCollection(folder.path, "research"); }
+    this.data.collapsed[`folder:draft:${folder.path}`] = false;
+    await this.saveState();
+    new Notice(`“${file.basename}” is now a folder.`);
   }
 
   // Less frequent document actions, kept out of the main long-press menu.
