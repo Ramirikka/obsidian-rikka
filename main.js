@@ -69,6 +69,80 @@ class RikkaTextModal extends Modal {
   }
 }
 
+// All projects as a grid of cards. Names edit in place; each card can open,
+// change folder, move left/right or be removed from Rikka (the folder stays).
+class RikkaProjectsModal extends Modal {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    this.modalEl.addClass("rikka-projects-modal");
+    this.setTitle("Projects");
+    this.render();
+  }
+  countNotes(path) {
+    const root = this.app.vault.getAbstractFileByPath(path);
+    if (!(root instanceof TFolder)) return null;
+    let n = 0;
+    const walk = (folder) => { for (const c of folder.children) { if (c instanceof TFolder) walk(c); else if (c.extension === "md") n++; } };
+    walk(root);
+    return n;
+  }
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    const grid = contentEl.createDiv({ cls: "rikka-projects-grid" });
+    const plugin = this.plugin;
+    const safe = (fn, label) => () => plugin.runSafely(async () => { await fn(); this.render(); }, label);
+    plugin.projects.forEach((project, index) => {
+      const active = project.id === plugin.data.activeProject;
+      const card = grid.createDiv({ cls: `rikka-project-card${active ? " is-active" : ""}` });
+      const name = card.createEl("input", { cls: "rikka-project-card-name", attr: { type: "text", value: project.name, "aria-label": "Project name", spellcheck: "false" } });
+      const commit = async () => {
+        const value = name.value.trim();
+        if (!value || value === project.name) { name.value = project.name; return; }
+        const result = await plugin.renameProject(project.id, value);
+        if (typeof result === "string") { new Notice(`“${value}” is already used. Try “${result}”.`); name.value = project.name; }
+      };
+      name.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); name.blur(); }
+        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); name.value = project.name; name.blur(); }
+      });
+      name.addEventListener("blur", () => plugin.runSafely(commit, "Rename project"));
+      const meta = card.createDiv({ cls: "rikka-project-card-meta" });
+      const count = this.countNotes(project.path);
+      meta.createDiv({ cls: "rikka-project-card-path", text: project.path });
+      meta.createDiv({ text: count === null ? "Folder missing" : `${count} note${count === 1 ? "" : "s"}${active ? " · open now" : ""}` });
+      const row = card.createDiv({ cls: "rikka-project-card-actions" });
+      const btn = (icon, label, fn, disabled = false) => {
+        const b = row.createEl("button", { cls: "clickable-icon", attr: { "aria-label": label, title: label } });
+        setIcon(b, icon);
+        b.disabled = disabled;
+        b.addEventListener("click", fn);
+        return b;
+      };
+      const open = row.createEl("button", { cls: active ? "" : "mod-cta", text: active ? "Open" : "Switch" });
+      open.addEventListener("click", () => plugin.runSafely(async () => { await plugin.selectProject(project.id); this.close(); }, "Switch project"));
+      btn("arrow-left", "Move left", safe(() => plugin.moveProject(project.id, -1), "Move project"), index === 0);
+      btn("arrow-right", "Move right", safe(() => plugin.moveProject(project.id, 1), "Move project"), index === plugin.projects.length - 1);
+      btn("folder-input", "Change folder…", () => {
+        const folders = this.app.vault.getAllLoadedFiles().filter((f) => f instanceof TFolder && f.path !== "/").map((f) => ({ value: f.path, label: f.path }));
+        new RikkaChoiceModal(this.app, `Folder for ${project.name}`, folders, async (path) => { await plugin.setProjectFolder(project.id, path); this.render(); }).open();
+      });
+      btn("x", "Remove from Rikka (folder and notes stay)", () => {
+        new RikkaChoiceModal(this.app, `Remove “${project.name}” from Rikka? Its folder and notes are not touched.`, [
+          { value: "yes", label: `Remove ${project.name} from the list` }, { value: "no", label: "Cancel" },
+        ], async (v) => { if (v === "yes") { await plugin.removeProject(project.id); this.render(); } }).open();
+      }, plugin.projects.length <= 1);
+    });
+    const add = grid.createEl("button", { cls: "rikka-project-card rikka-project-card-new" });
+    setIcon(add.createSpan(), "plus");
+    add.createSpan({ text: "New project" });
+    add.addEventListener("click", () => { this.close(); plugin.promptNewProject(); });
+  }
+}
+
 // Remembers meaningful text typed into a name dialog that was dismissed
 // without creating anything, so an accidental swipe never loses it.
 const RIKKA_NAME_DRAFTS = new Map();
@@ -182,17 +256,27 @@ class RikkaBinderView extends ItemView {
     const projectPicker = toolbar.createEl("select", { cls: "rikka-project-picker", attr: { "aria-label": "Active project" } });
     for (const project of this.plugin.projects) projectPicker.createEl("option", { value: project.id, text: project.name });
     projectPicker.createEl("option", { value: "__new_project__", text: "＋ New project…" });
+    projectPicker.createEl("option", { value: "__rename_project__", text: "Rename this project…" });
+    projectPicker.createEl("option", { value: "__all_projects__", text: "All projects…" });
     projectPicker.value = this.plugin.data.activeProject;
+    // Double-click the name to rename it.
+    projectPicker.addEventListener("dblclick", (event) => { event.preventDefault(); this.plugin.promptRenameProject(); });
     projectPicker.addEventListener("change", () => {
-      if (projectPicker.value === "__new_project__") {
-        projectPicker.value = this.plugin.data.activeProject;
+      const choice = projectPicker.value;
+      if (choice.startsWith("__")) projectPicker.value = this.plugin.data.activeProject;
+      if (choice === "__new_project__") {
         this.plugin.promptNewProject();
+      } else if (choice === "__rename_project__") {
+        this.plugin.promptRenameProject();
+      } else if (choice === "__all_projects__") {
+        new RikkaProjectsModal(this.plugin).open();
       } else {
         this.plugin.runSafely(() => this.plugin.selectProject(projectPicker.value), "Switch project");
       }
     });
     // "+" always means "add here": both create buttons use the current location.
     const actions = toolbar.createDiv({ cls: "rikka-toolbar-actions" });
+    if (!Platform.isMobile) this.makeToolbarButton(actions, "layout-grid", "All projects", () => new RikkaProjectsModal(this.plugin).open());
     this.makeToolbarButton(actions, "file-plus-2", "New document here", () => this.plugin.promptNewNote());
     this.makeToolbarButton(actions, "folder-plus", "New folder here", () => this.plugin.promptNewFolder());
     this.makeToolbarButton(actions, "more-horizontal", "More", (event) => this.plugin.showToolbarMore(event));
@@ -2374,6 +2458,55 @@ module.exports = class RikkaPlugin extends Plugin {
     }).open();
   }
 
+  // Project names are labels: renaming one never moves or renames its folder.
+  async renameProject(projectId, name) {
+    const project = this.projects.find((p) => p.id === projectId);
+    const clean = String(name || "").replace(/\s+/g, " ").trim();
+    if (!project) throw new Error("Project not found.");
+    if (!clean) return "Enter a name.";
+    if (this.projects.some((p) => p !== project && p.name.toLowerCase() === clean.toLowerCase())) return `${clean} 2`;
+    project.name = clean;
+    this.data.projects = this.projects;
+    await this.saveState();
+  }
+
+  promptRenameProject(projectId = this.data.activeProject) {
+    const project = this.projects.find((p) => p.id === projectId);
+    if (!project) return;
+    new RikkaNameModal(this.app, "Rename project", "Project name", (name) => this.renameProject(project.id, name),
+      { buttonText: "Rename", initialValue: project.name, subtitle: `Folder: ${project.path} (stays the same)` }).open();
+  }
+
+  async setProjectFolder(projectId, path) {
+    const project = this.projects.find((p) => p.id === projectId);
+    if (!project || !(this.app.vault.getAbstractFileByPath(path) instanceof TFolder)) throw new Error("Folder not found.");
+    project.path = path;
+    if (projectId === this.data.activeProject) this.data.context = { section: "draft", folder: "" };
+    else if (this.data.projectStates[projectId]) this.data.projectStates[projectId].context = { section: "draft", folder: "" };
+    this.data.projects = this.projects;
+    await this.saveState();
+  }
+
+  async removeProject(projectId) {
+    if (this.projects.length <= 1) throw new Error("Keep at least one project.");
+    const index = this.projects.findIndex((p) => p.id === projectId);
+    if (index < 0) return;
+    if (projectId === this.data.activeProject) await this.selectProject(this.projects[index === 0 ? 1 : 0].id);
+    this.projects.splice(index, 1);
+    delete this.data.projectStates[projectId];
+    this.data.projects = this.projects;
+    await this.saveState();
+  }
+
+  async moveProject(projectId, delta) {
+    const i = this.projects.findIndex((p) => p.id === projectId);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= this.projects.length) return;
+    [this.projects[i], this.projects[j]] = [this.projects[j], this.projects[i]];
+    this.data.projects = this.projects;
+    await this.saveState();
+  }
+
   get projectRoot() {
     return this.app.vault.getAbstractFileByPath(this.activeProject.path);
   }
@@ -3535,6 +3668,9 @@ module.exports = class RikkaPlugin extends Plugin {
     const info = this.contextInfo();
     menu.addItem((entry) => entry.setTitle(`New from template in ${info.name}…`).setIcon("files").onClick(() => this.promptNewFromTemplate()));
     menu.addItem((entry) => entry.setTitle("New collection…").setIcon("library").onClick(() => this.promptNewCollection()));
+    menu.addSeparator();
+    menu.addItem((entry) => entry.setTitle("All projects…").setIcon("layout-grid").onClick(() => new RikkaProjectsModal(this).open()));
+    menu.addItem((entry) => entry.setTitle(`Rename “${this.activeProject.name}”…`).setIcon("pencil").onClick(() => this.promptRenameProject()));
     menu.addSeparator();
     menu.addItem((entry) => entry.setTitle("Compile Draft to Markdown").setIcon("scroll-text").onClick(() => this.runSafely(() => this.compileDraft(), "Compile Draft")));
     if (event instanceof MouseEvent) menu.showAtMouseEvent(event);

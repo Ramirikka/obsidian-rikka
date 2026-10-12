@@ -732,3 +732,22 @@ body.is-mobile .base-board-card { border-radius: var(--radius-m, 8px); }
 .rikka-qa-report ul { padding-left: 16px; }
 .rikka-qa-pass { color: var(--text-muted); }
 .rikka-qa-fail { color: var(--text-error); font-weight: 600; }
+
+/* All projects grid */
+.rikka-projects-modal { width: min(760px, 94vw); }
+.rikka-projects-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+.rikka-project-card {
+  display: flex; flex-direction: column; gap: 8px; padding: 12px;
+  border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m, 8px);
+  background: var(--background-secondary);
+}
+.rikka-project-card.is-active { border-color: var(--interactive-accent); }
+.rikka-project-card-name { font-weight: 600; font-size: var(--font-ui-medium); width: 100%; background: transparent; border: 1px solid transparent; padding: 4px 6px; }
+.rikka-project-card-name:hover, .rikka-project-card-name:focus { border-color: var(--background-modifier-border); background: var(--background-primary); }
+.rikka-project-card-meta { font-size: var(--font-ui-smaller); color: var(--text-muted); display: flex; flex-direction: column; gap: 2px; }
+.rikka-project-card-path { overflow-wrap: anywhere; }
+.rikka-project-card-actions { display: flex; align-items: center; gap: 4px; margin-top: auto; }
+.rikka-project-card-actions > button:first-child { margin-right: auto; }
+.rikka-project-card-new { align-items: center; justify-content: center; flex-direction: row; min-height: 120px; border-style: dashed; background: transparent; color: var(--text-muted); cursor: pointer; box-shadow: none; }
+body.is-phone .rikka-projects-grid { grid-template-columns: 1fr; }
+body.is-mobile .rikka-project-card-actions button { min-width: 40px; min-height: 40px; }
